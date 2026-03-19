@@ -1,6 +1,6 @@
 <div align="center">
 
-![BqForge Preview](assets/Screenshot%202026-03-20%20at%202.52.54%20AM.png)
+![BqForge Preview](assets/preview.png)
 
 # BqForge
 
