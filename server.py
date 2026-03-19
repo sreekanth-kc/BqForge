@@ -1,0 +1,613 @@
+"""
+BigQuery Best Practices MCP Server (BqForge)
+Exposes BigQuery best practices as Tools and Resources.
+
+Context7-style workflow:
+  1. resolve_topic("reduce query cost")  → ranked list of practice IDs
+  2. get_practices(topic=..., max_tokens=3000) → focused content within token budget
+"""
+
+import json
+import re
+from mcp.server import Server
+from mcp.server.stdio import stdio_server
+from mcp import types
+
+# ─────────────────────────────────────────────
+# Knowledge base
+# ─────────────────────────────────────────────
+from data.query_optimization import QUERY_OPTIMIZATION
+from data.schema_design import SCHEMA_DESIGN
+from data.cost_management import COST_MANAGEMENT
+from data.security import SECURITY
+from data.materialized_views import MATERIALIZED_VIEWS
+from data.monitoring import MONITORING
+from data.data_ingestion import DATA_INGESTION
+from data.workload_management import WORKLOAD_MANAGEMENT
+
+ALL_PRACTICES: dict[str, dict] = {
+    "query_optimization": QUERY_OPTIMIZATION,
+    "schema_design": SCHEMA_DESIGN,
+    "cost_management": COST_MANAGEMENT,
+    "security": SECURITY,
+    "materialized_views": MATERIALIZED_VIEWS,
+    "monitoring": MONITORING,
+    "data_ingestion": DATA_INGESTION,
+    "workload_management": WORKLOAD_MANAGEMENT,
+}
+
+# Pre-built flat index: id → (category, practice_dict)
+_PRACTICE_INDEX: dict[str, tuple[str, dict]] = {
+    p["id"]: (cat, p)
+    for cat, data in ALL_PRACTICES.items()
+    for p in data["practices"]
+}
+
+# Stop-words stripped before keyword scoring
+_STOP_WORDS = {
+    "how", "do", "i", "to", "the", "a", "an", "in", "for", "of", "is",
+    "are", "my", "what", "should", "can", "best", "practice", "bigquery",
+    "bq", "using", "use", "with", "from", "on", "and", "or", "at", "be",
+    "this", "that", "it", "its", "when", "which", "why", "where",
+}
+
+# ─────────────────────────────────────────────
+# Server setup
+# ─────────────────────────────────────────────
+server = Server("bqforge")
+
+
+# ═══════════════════════════════════════════════
+# RESOURCES  – static, browsable documentation
+# ═══════════════════════════════════════════════
+@server.list_resources()
+async def list_resources() -> list[types.Resource]:
+    resources = []
+    for key, data in ALL_PRACTICES.items():
+        resources.append(
+            types.Resource(
+                uri=f"bigquery://{key}",
+                name=data["title"],
+                description=data["description"],
+                mimeType="application/json",
+            )
+        )
+    resources.append(
+        types.Resource(
+            uri="bigquery://overview",
+            name="BigQuery Best Practices Overview",
+            description="High-level overview of all BqForge best-practice categories.",
+            mimeType="text/plain",
+        )
+    )
+    resources.append(
+        types.Resource(
+            uri="bigquery://prompt",
+            name="BqForge – System Prompt Snippet",
+            description=(
+                "Paste this into your system prompt to activate automatic BqForge "
+                "lookups whenever BigQuery topics arise."
+            ),
+            mimeType="text/plain",
+        )
+    )
+    return resources
+
+
+@server.read_resource()
+async def read_resource(uri: types.AnyUrl) -> str:
+    uri_str = str(uri)
+
+    if uri_str == "bigquery://overview":
+        lines = ["# BqForge – BigQuery Best Practices Overview\n"]
+        total = sum(len(d["practices"]) for d in ALL_PRACTICES.values())
+        lines.append(f"**{total} practices across {len(ALL_PRACTICES)} categories.**\n")
+        for key, data in ALL_PRACTICES.items():
+            lines.append(f"## {data['title']}")
+            lines.append(f"{data['description']}\n")
+            lines.append(f"Resource URI : `bigquery://{key}`")
+            lines.append(f"Practices    : {len(data['practices'])}\n")
+        return "\n".join(lines)
+
+    if uri_str == "bigquery://prompt":
+        return _SYSTEM_PROMPT_SNIPPET
+
+    key = uri_str.replace("bigquery://", "")
+    if key not in ALL_PRACTICES:
+        raise ValueError(f"Unknown resource: {uri_str}")
+    return json.dumps(ALL_PRACTICES[key], indent=2)
+
+
+# ═══════════════════════════════════════════════
+# TOOLS  – callable functions
+# ═══════════════════════════════════════════════
+@server.list_tools()
+async def list_tools() -> list[types.Tool]:
+    return [
+        # ── Context7-style: step 1
+        types.Tool(
+            name="resolve_topic",
+            description=(
+                "Resolve a natural-language BigQuery topic or question to the most "
+                "relevant best-practice IDs. Use this FIRST to discover which practice "
+                "IDs apply, then call get_practices for the full content. "
+                "Returns a ranked list with relevance scores."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Natural-language topic or question, e.g. 'reduce query cost' or 'PII column security'.",
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "description": "Maximum number of results to return (default 5, max 20).",
+                        "default": 5,
+                    },
+                },
+                "required": ["query"],
+            },
+        ),
+        # ── Context7-style: step 2
+        types.Tool(
+            name="get_practices",
+            description=(
+                "Retrieve focused BigQuery best-practice content for a topic, "
+                "constrained to a token budget. Assembles the most relevant practices "
+                "in relevance order until the budget is exhausted. "
+                "Pair with resolve_topic for the full Context7-style workflow."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "topic": {
+                        "type": "string",
+                        "description": "Topic or question to retrieve practices for.",
+                    },
+                    "max_tokens": {
+                        "type": "integer",
+                        "description": "Approximate token budget for the returned content (default 3000).",
+                        "default": 3000,
+                    },
+                    "practice_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional: fetch specific practice IDs instead of resolving by topic.",
+                    },
+                },
+                "required": ["topic"],
+            },
+        ),
+        # ── Existing tools
+        types.Tool(
+            name="get_best_practices",
+            description=(
+                "Retrieve ALL practices for a category. "
+                "Categories: query_optimization, schema_design, cost_management, "
+                "security, materialized_views, monitoring."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "category": {
+                        "type": "string",
+                        "enum": list(ALL_PRACTICES.keys()),
+                        "description": "The best-practice category to retrieve.",
+                    }
+                },
+                "required": ["category"],
+            },
+        ),
+        types.Tool(
+            name="search_practices",
+            description="Full-text keyword search across all BigQuery best practices.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Keyword(s) to search for.",
+                    }
+                },
+                "required": ["query"],
+            },
+        ),
+        types.Tool(
+            name="get_practice_detail",
+            description="Get full detail for a single best-practice rule by its ID (e.g. 'QO-001').",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "practice_id": {
+                        "type": "string",
+                        "description": "The practice ID, e.g. 'QO-001'.",
+                    }
+                },
+                "required": ["practice_id"],
+            },
+        ),
+        types.Tool(
+            name="review_query",
+            description=(
+                "Analyse a SQL query and surface relevant BigQuery best-practice "
+                "warnings and suggestions."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "sql": {
+                        "type": "string",
+                        "description": "The BigQuery SQL query to review.",
+                    }
+                },
+                "required": ["sql"],
+            },
+        ),
+        types.Tool(
+            name="list_all_practice_ids",
+            description="Return a compact list of every practice ID + title across all categories.",
+            inputSchema={"type": "object", "properties": {}},
+        ),
+    ]
+
+
+@server.call_tool()
+async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
+    if name == "resolve_topic":
+        return _resolve_topic(arguments["query"], arguments.get("top_k", 5))
+    elif name == "get_practices":
+        return _get_practices(
+            arguments["topic"],
+            arguments.get("max_tokens", 3000),
+            arguments.get("practice_ids"),
+        )
+    elif name == "get_best_practices":
+        return _get_best_practices(arguments["category"])
+    elif name == "search_practices":
+        return _search_practices(arguments["query"])
+    elif name == "get_practice_detail":
+        return _get_practice_detail(arguments["practice_id"])
+    elif name == "review_query":
+        return _review_query(arguments["sql"])
+    elif name == "list_all_practice_ids":
+        return _list_all_practice_ids()
+    else:
+        return [types.TextContent(type="text", text=f"Unknown tool: {name}")]
+
+
+# ─────────────────────────────────────────────
+# Helper: keyword scoring
+# ─────────────────────────────────────────────
+def _score_practice(keywords: set[str], practice: dict) -> int:
+    """Score a practice dict against a set of keywords."""
+    score = 0
+
+    def _words(text: str) -> set[str]:
+        return set(re.sub(r"[^a-z0-9\s]", " ", text.lower()).split())
+
+    # Title: weight 4
+    score += len(keywords & _words(practice["title"])) * 4
+    # Description: weight 2
+    score += len(keywords & _words(practice["description"])) * 2
+    # Do / dont: weight 1 each
+    for item in practice.get("do", []) + practice.get("dont", []):
+        score += len(keywords & _words(item)) * 1
+    # Impact tag: weight 3
+    score += len(keywords & _words(practice.get("impact", ""))) * 3
+    # Severity: weight 1
+    score += len(keywords & _words(practice.get("severity", ""))) * 1
+
+    return score
+
+
+def _extract_keywords(query: str) -> set[str]:
+    tokens = set(re.sub(r"[^a-z0-9\s]", " ", query.lower()).split())
+    return tokens - _STOP_WORDS
+
+
+# ─────────────────────────────────────────────
+# Tool: resolve_topic
+# ─────────────────────────────────────────────
+def _resolve_topic(query: str, top_k: int = 5) -> list[types.TextContent]:
+    top_k = min(max(top_k, 1), 20)
+    keywords = _extract_keywords(query)
+
+    if not keywords:
+        return [types.TextContent(type="text", text="Query too generic – try adding more specific terms.")]
+
+    scored: list[dict] = []
+    for category, data in ALL_PRACTICES.items():
+        for p in data["practices"]:
+            score = _score_practice(keywords, p)
+            if score > 0:
+                scored.append({
+                    "id": p["id"],
+                    "title": p["title"],
+                    "category": category,
+                    "severity": p["severity"],
+                    "impact": p["impact"],
+                    "relevance_score": score,
+                })
+
+    scored.sort(key=lambda x: x["relevance_score"], reverse=True)
+    results = scored[:top_k]
+
+    if not results:
+        return [types.TextContent(
+            type="text",
+            text=f"No practices matched '{query}'. Try broader terms or use list_all_practice_ids."
+        )]
+
+    lines = [f"# Topic Resolution: '{query}'\n"]
+    lines.append(f"Found {len(results)} relevant practice(s) (of {len(scored)} total matches):\n")
+    for r in results:
+        lines.append(
+            f"- **{r['id']}** – {r['title']}\n"
+            f"  Category: `{r['category']}` | Severity: {r['severity']} | Impact: {r['impact']}\n"
+            f"  Relevance score: {r['relevance_score']}"
+        )
+    lines.append(
+        f"\n**Next step:** call `get_practices(topic=\"{query}\")` "
+        "to retrieve the full content within a token budget."
+    )
+    return [types.TextContent(type="text", text="\n".join(lines))]
+
+
+# ─────────────────────────────────────────────
+# Tool: get_practices  (token-budgeted)
+# ─────────────────────────────────────────────
+def _render_practice_block(practice: dict, category: str) -> str:
+    """Render a single practice to a markdown string."""
+    lines = [
+        f"## [{practice['id']}] {practice['title']}",
+        f"**Category**: {category}  |  **Severity**: {practice['severity']}  |  **Impact**: {practice['impact']}",
+        f"\n{practice['description']}\n",
+        "**Do:**",
+    ]
+    for item in practice["do"]:
+        lines.append(f"  ✅ {item}")
+    lines.append("\n**Avoid:**")
+    for item in practice["dont"]:
+        lines.append(f"  ❌ {item}")
+    if practice.get("example"):
+        lines.append(f"\n**Example:**\n```sql\n{practice['example']}\n```")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _get_practices(
+    topic: str,
+    max_tokens: int = 3000,
+    practice_ids: list[str] | None = None,
+) -> list[types.TextContent]:
+    chars_budget = max_tokens * 4  # rough ~4 chars / token
+
+    if practice_ids:
+        # Explicit IDs requested
+        ordered: list[tuple[str, dict]] = []
+        for pid in practice_ids:
+            entry = _PRACTICE_INDEX.get(pid.upper())
+            if entry:
+                ordered.append(entry)
+    else:
+        # Resolve by topic relevance
+        keywords = _extract_keywords(topic)
+        scored: list[tuple[int, str, dict]] = []
+        for category, data in ALL_PRACTICES.items():
+            for p in data["practices"]:
+                s = _score_practice(keywords, p)
+                if s > 0:
+                    scored.append((s, category, p))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        ordered = [(cat, p) for _, cat, p in scored]
+
+    if not ordered:
+        return [types.TextContent(
+            type="text",
+            text=f"No practices found for topic: '{topic}'. Try resolve_topic first."
+        )]
+
+    header = f"# BigQuery Best Practices: {topic}\n\n"
+    body_parts: list[str] = []
+    chars_used = len(header)
+
+    for category, practice in ordered:
+        block = _render_practice_block(practice, category)
+        if chars_used + len(block) > chars_budget:
+            if not body_parts:
+                # Always include at least one result
+                body_parts.append(block)
+            break
+        body_parts.append(block)
+        chars_used += len(block)
+
+    included = len(body_parts)
+    remaining = len(ordered) - included
+    footer_parts = [f"\n---\n_Showing {included} of {len(ordered)} matching practice(s)._"]
+    if remaining > 0:
+        footer_parts.append(
+            f"_{remaining} more practice(s) available – increase max_tokens or use resolve_topic to narrow the scope._"
+        )
+    footer_parts.append(f"_Token budget: ~{chars_used // 4} / {max_tokens}_")
+
+    content = header + "\n".join(body_parts) + "\n".join(footer_parts)
+    return [types.TextContent(type="text", text=content)]
+
+
+# ─────────────────────────────────────────────
+# Tool: get_best_practices
+# ─────────────────────────────────────────────
+def _get_best_practices(category: str) -> list[types.TextContent]:
+    data = ALL_PRACTICES[category]
+    lines = [f"# {data['title']}", f"\n{data['description']}\n"]
+    for p in data["practices"]:
+        lines.append(f"## [{p['id']}] {p['title']}")
+        lines.append(f"**Severity**: {p['severity']}  |  **Impact**: {p['impact']}")
+        lines.append(f"\n{p['description']}\n")
+        lines.append("**Do this:**")
+        for do in p["do"]:
+            lines.append(f"  ✅ {do}")
+        lines.append("\n**Avoid:**")
+        for dont in p["dont"]:
+            lines.append(f"  ❌ {dont}")
+        if p.get("example"):
+            lines.append(f"\n**Example:**\n```sql\n{p['example']}\n```")
+        lines.append("")
+    return [types.TextContent(type="text", text="\n".join(lines))]
+
+
+# ─────────────────────────────────────────────
+# Tool: search_practices
+# ─────────────────────────────────────────────
+def _search_practices(query: str) -> list[types.TextContent]:
+    q = query.lower()
+    results = []
+    for category, data in ALL_PRACTICES.items():
+        for p in data["practices"]:
+            haystack = (
+                p["title"] + p["description"] + " ".join(p["do"] + p["dont"])
+            ).lower()
+            if q in haystack:
+                results.append(
+                    f"[{p['id']}] {p['title']}  (category: {category})\n"
+                    f"  → {p['description'][:120]}…"
+                )
+    if not results:
+        return [types.TextContent(type="text", text=f"No practices found for '{query}'.")]
+    output = f"Found {len(results)} practice(s) matching '{query}':\n\n" + "\n\n".join(results)
+    return [types.TextContent(type="text", text=output)]
+
+
+# ─────────────────────────────────────────────
+# Tool: get_practice_detail
+# ─────────────────────────────────────────────
+def _get_practice_detail(practice_id: str) -> list[types.TextContent]:
+    entry = _PRACTICE_INDEX.get(practice_id.upper())
+    if entry:
+        _, practice = entry
+        return [types.TextContent(type="text", text=json.dumps(practice, indent=2))]
+    return [types.TextContent(type="text", text=f"Practice ID '{practice_id}' not found.")]
+
+
+# ─────────────────────────────────────────────
+# Tool: list_all_practice_ids
+# ─────────────────────────────────────────────
+def _list_all_practice_ids() -> list[types.TextContent]:
+    total = sum(len(d["practices"]) for d in ALL_PRACTICES.values())
+    lines = [f"# All BqForge Practice IDs  ({total} total)\n"]
+    for category, data in ALL_PRACTICES.items():
+        lines.append(f"## {data['title']}")
+        for p in data["practices"]:
+            lines.append(f"  {p['id']:10s} – {p['title']}")
+        lines.append("")
+    return [types.TextContent(type="text", text="\n".join(lines))]
+
+
+# ─────────────────────────────────────────────
+# Tool: review_query
+# ─────────────────────────────────────────────
+def _review_query(sql: str) -> list[types.TextContent]:
+    sql_lower = sql.lower()
+    findings: list[str] = []
+
+    checks = [
+        (lambda s: "select *" in s,
+         "QO-001",
+         "SELECT * detected – avoid selecting all columns; specify only what you need."),
+        (lambda s: "cross join" in s,
+         "QO-003",
+         "CROSS JOIN detected – produces a cartesian product; extremely expensive on large tables."),
+        (lambda s: "order by" in s and "limit" not in s,
+         "QO-004",
+         "ORDER BY without LIMIT – sorting the full result set wastes resources."),
+        (lambda s: any(f in s for f in ["now()", "current_timestamp()", "current_date()"]),
+         "CO-002",
+         "Non-deterministic function (NOW/CURRENT_TIMESTAMP) detected – prevents query-result caching."),
+        (lambda s: "where" not in s and "from" in s,
+         "QO-002",
+         "No WHERE / partition filter detected – consider filtering on a partition column to reduce scan cost."),
+        (lambda s: "not in (select" in s,
+         "QO-005",
+         "NOT IN (subquery) detected – prefer NOT EXISTS or LEFT JOIN / IS NULL for better performance."),
+        (lambda s: s.count("select") > 2,
+         "QO-004",
+         "Multiple nested subqueries detected – consider CTEs (WITH clauses) for readability and optimisation."),
+        (lambda s: "having" in s and "group by" not in s,
+         "QO-004",
+         "HAVING without GROUP BY – this may be a logic error; HAVING filters grouped results."),
+        (lambda s: "count(distinct" in s,
+         "QO-006",
+         "COUNT(DISTINCT) detected – consider APPROX_COUNT_DISTINCT() for large datasets where ~1% error is acceptable."),
+    ]
+
+    for pattern_fn, pid, msg in checks:
+        if pattern_fn(sql_lower):
+            findings.append(f"⚠️  [{pid}] {msg}")
+
+    if not findings:
+        result = (
+            "✅ No obvious best-practice violations detected.\n\n"
+            "Always verify: partition pruning is active, clustering columns are filtered, "
+            "and data types match the column definitions."
+        )
+    else:
+        result = (
+            f"Found {len(findings)} potential issue(s):\n\n"
+            + "\n".join(findings)
+            + "\n\nUse `get_practice_detail` with any ID above for full guidance, "
+            "or `get_practices` with a relevant topic for broader context."
+        )
+    return [types.TextContent(type="text", text=result)]
+
+
+# ─────────────────────────────────────────────
+# "use bqforge" system prompt snippet
+# ─────────────────────────────────────────────
+_SYSTEM_PROMPT_SNIPPET = """\
+# BqForge – BigQuery Best Practices (use bqforge)
+
+You have access to the BqForge MCP server which provides curated, structured
+BigQuery best practices across 6 categories (query optimisation, schema design,
+cost management, security, materialized views, monitoring).
+
+## When to use BqForge
+
+| User request                                    | Tool to call                         |
+|-------------------------------------------------|--------------------------------------|
+| Asks about a BigQuery topic                     | resolve_topic → get_practices        |
+| Shares SQL for review                           | review_query                         |
+| Wants all practices in one category             | get_best_practices                   |
+| Searches by keyword                             | search_practices                     |
+| Wants details on a specific rule (e.g. QO-002) | get_practice_detail                  |
+
+## Recommended workflow (Context7-style)
+
+1. Call `resolve_topic(query="<user intent>")` → get ranked practice IDs
+2. Call `get_practices(topic="<user intent>", max_tokens=3000)` → focused content
+3. Use the returned practices to inform your response
+4. **Always cite practice IDs** (e.g. QO-002, SD-001) when giving recommendations
+
+## Token budget guidance
+
+- Quick answer  : max_tokens=1500
+- Normal answer : max_tokens=3000  (default)
+- Deep dive     : max_tokens=6000
+"""
+
+
+# ─────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────
+async def main():
+    async with stdio_server() as (read_stream, write_stream):
+        await server.run(
+            read_stream,
+            write_stream,
+            server.create_initialization_options(),
+        )
+
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())

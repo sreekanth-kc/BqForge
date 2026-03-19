@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "bigquery-best-practices-mcp"
+version = "1.0.0"
+description = "MCP server exposing BigQuery best practices as tools and resources"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["mcp>=1.0.0"]
+
+[project.scripts]
+bigquery-mcp = "server:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
