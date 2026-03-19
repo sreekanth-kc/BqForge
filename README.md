@@ -3,7 +3,7 @@
 A Model Context Protocol (MCP) server that exposes curated Google BigQuery best
 practices as **Tools** and **Resources**.
 
-Designed with a **Context7-style two-step workflow**: resolve a topic to ranked
+Designed with a **two-step workflow**: resolve a topic to ranked
 practice IDs, then fetch focused content within a token budget.
 
 ## Covered Categories
@@ -87,7 +87,7 @@ BigQuery topics arise.
 
 ## Available Tools
 
-### Context7-style workflow (recommended)
+### Recommended workflow
 
 | Tool | Description |
 |---|---|

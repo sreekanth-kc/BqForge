@@ -2,7 +2,7 @@
 BigQuery Best Practices MCP Server (BqForge)
 Exposes BigQuery best practices as Tools and Resources.
 
-Context7-style workflow:
+Two-step workflow:
   1. resolve_topic("reduce query cost")  → ranked list of practice IDs
   2. get_practices(topic=..., max_tokens=3000) → focused content within token budget
 """
@@ -124,7 +124,7 @@ async def read_resource(uri: types.AnyUrl) -> str:
 @server.list_tools()
 async def list_tools() -> list[types.Tool]:
     return [
-        # ── Context7-style: step 1
+        # ── Step 1: resolve topic
         types.Tool(
             name="resolve_topic",
             description=(
@@ -149,14 +149,14 @@ async def list_tools() -> list[types.Tool]:
                 "required": ["query"],
             },
         ),
-        # ── Context7-style: step 2
+        # ── Step 2: fetch practices
         types.Tool(
             name="get_practices",
             description=(
                 "Retrieve focused BigQuery best-practice content for a topic, "
                 "constrained to a token budget. Assembles the most relevant practices "
                 "in relevance order until the budget is exhausted. "
-                "Pair with resolve_topic for the full Context7-style workflow."
+                "Pair with resolve_topic for the full two-step workflow."
             ),
             inputSchema={
                 "type": "object",
@@ -581,7 +581,7 @@ cost management, security, materialized views, monitoring).
 | Searches by keyword                             | search_practices                     |
 | Wants details on a specific rule (e.g. QO-002) | get_practice_detail                  |
 
-## Recommended workflow (Context7-style)
+## Recommended workflow
 
 1. Call `resolve_topic(query="<user intent>")` → get ranked practice IDs
 2. Call `get_practices(topic="<user intent>", max_tokens=3000)` → focused content
