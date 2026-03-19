@@ -6,6 +6,8 @@ practices as **Tools** and **Resources**.
 Designed with a **two-step workflow**: resolve a topic to ranked
 practice IDs, then fetch focused content within a token budget.
 
+**Live site:** [sreekanth-kc.github.io/BqForge-FE](https://sreekanth-kc.github.io/BqForge-FE/)
+
 ## Covered Categories
 
 | Category | Practices | ID Prefix |
