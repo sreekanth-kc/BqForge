@@ -25,6 +25,9 @@ from data.materialized_views import MATERIALIZED_VIEWS
 from data.monitoring import MONITORING
 from data.data_ingestion import DATA_INGESTION
 from data.workload_management import WORKLOAD_MANAGEMENT
+from data.partitioning import PARTITIONING
+from data.bi_engine import BI_ENGINE
+from data.storage_pricing import STORAGE_PRICING
 
 ALL_PRACTICES: dict[str, dict] = {
     "query_optimization": QUERY_OPTIMIZATION,
@@ -35,6 +38,9 @@ ALL_PRACTICES: dict[str, dict] = {
     "monitoring": MONITORING,
     "data_ingestion": DATA_INGESTION,
     "workload_management": WORKLOAD_MANAGEMENT,
+    "partitioning": PARTITIONING,
+    "bi_engine": BI_ENGINE,
+    "storage_pricing": STORAGE_PRICING,
 }
 
 # Pre-built flat index: id → (category, practice_dict)
@@ -446,6 +452,178 @@ async def list_tools() -> list[types.Tool]:
                 "required": ["job_id"],
             },
         ),
+        types.Tool(
+            name="estimate_query_cost",
+            description=(
+                "Dry-run a query and return a human-friendly cost estimate with tier label "
+                "(negligible / low / moderate / high) and cost-reduction tips when the estimate is high."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "sql": {"type": "string", "description": "The SQL query to estimate."},
+                },
+                "required": ["sql"],
+            },
+        ),
+        types.Tool(
+            name="get_expensive_queries",
+            description=(
+                "Surface the top N most expensive queries from INFORMATION_SCHEMA, "
+                "including their SQL snippets, cost, bytes processed, and user."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "days": {"type": "integer", "description": "Lookback window in days (default 7).", "default": 7},
+                    "top_n": {"type": "integer", "description": "Number of queries to return (default 10).", "default": 10},
+                    "region": {"type": "string", "description": "BQ region slug (default 'us').", "default": "us"},
+                },
+            },
+        ),
+        types.Tool(
+            name="get_slot_utilization",
+            description=(
+                "Show slot-hours consumed per reservation over a time window. "
+                "Useful for capacity planning and understanding flat-rate vs on-demand usage."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "days": {"type": "integer", "description": "Lookback window in days (default 7).", "default": 7},
+                    "region": {"type": "string", "description": "BQ region slug (default 'us').", "default": "us"},
+                },
+            },
+        ),
+        types.Tool(
+            name="check_data_freshness",
+            description=(
+                "Report how old a table's data is and flag it as STALE if it exceeds a threshold. "
+                "Useful for monitoring ingestion pipelines."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "table_ref": {"type": "string", "description": "Table reference: project.dataset.table or dataset.table"},
+                    "stale_hours": {
+                        "type": "integer",
+                        "description": "Hours after which the table is considered stale (default 24).",
+                        "default": 24,
+                    },
+                },
+                "required": ["table_ref"],
+            },
+        ),
+        types.Tool(
+            name="detect_schema_drift",
+            description=(
+                "Compare an expected schema (JSON array) against the actual BigQuery table schema. "
+                "Reports missing columns, extra columns, and type mismatches."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "table_ref": {"type": "string", "description": "Table to inspect."},
+                    "expected_schema_json": {
+                        "type": "string",
+                        "description": (
+                            'JSON array of expected columns, e.g. '
+                            '[{"name": "user_id", "type": "INT64"}, {"name": "event_date", "type": "DATE"}]'
+                        ),
+                    },
+                },
+                "required": ["table_ref", "expected_schema_json"],
+            },
+        ),
+        types.Tool(
+            name="suggest_schema_improvements",
+            description=(
+                "Analyse a table's schema against BqForge best practices and return "
+                "specific improvement suggestions (partitioning, clustering, data types, nesting)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "table_ref": {"type": "string", "description": "Table reference: project.dataset.table or dataset.table"},
+                },
+                "required": ["table_ref"],
+            },
+        ),
+        types.Tool(
+            name="compare_tables",
+            description=(
+                "Diff schemas between two BigQuery tables — reports type mismatches, "
+                "missing/extra columns, and partition/cluster differences."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "table_a": {"type": "string", "description": "First table reference."},
+                    "table_b": {"type": "string", "description": "Second table reference."},
+                },
+                "required": ["table_a", "table_b"],
+            },
+        ),
+        types.Tool(
+            name="list_materialized_views",
+            description="List all materialized views in a dataset with refresh status, age, and query definition.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "dataset_id": {"type": "string", "description": "Dataset to inspect."},
+                    "project_id": {"type": "string", "description": "GCP project (defaults to authenticated project)."},
+                },
+                "required": ["dataset_id"],
+            },
+        ),
+        types.Tool(
+            name="explain_query_plan",
+            description=(
+                "Parse the execution plan of a completed BigQuery job and surface "
+                "stage-by-stage statistics, bottlenecks, and filtering efficiency."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "string", "description": "The BigQuery job ID to explain."},
+                    "location": {"type": "string", "description": "Job location (default 'US').", "default": "US"},
+                },
+                "required": ["job_id"],
+            },
+        ),
+        # ── Static intelligence tools (no GCP required)
+        types.Tool(
+            name="generate_cte_refactor",
+            description=(
+                "Analyse a SQL query and suggest a CTE (WITH clause) based refactor "
+                "when deeply nested subqueries are detected."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "sql": {"type": "string", "description": "The SQL query to refactor."},
+                },
+                "required": ["sql"],
+            },
+        ),
+        types.Tool(
+            name="suggest_materialized_view",
+            description=(
+                "Analyse a SQL query and recommend whether a Materialized View would help, "
+                "then generate the CREATE MATERIALIZED VIEW statement."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "sql": {"type": "string", "description": "The SQL query to analyse."},
+                    "dataset_id": {
+                        "type": "string",
+                        "description": "Target dataset for the MV (optional, used in generated DDL).",
+                    },
+                },
+                "required": ["sql"],
+            },
+        ),
     ]
 
 
@@ -517,6 +695,47 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             job_id=arguments["job_id"],
             location=arguments.get("location", "US"),
         )
+    elif name == "estimate_query_cost":
+        return await gcp_tools.estimate_query_cost(arguments["sql"])
+    elif name == "get_expensive_queries":
+        return await gcp_tools.get_expensive_queries(
+            days=arguments.get("days", 7),
+            top_n=arguments.get("top_n", 10),
+            region=arguments.get("region", "us"),
+        )
+    elif name == "get_slot_utilization":
+        return await gcp_tools.get_slot_utilization(
+            days=arguments.get("days", 7),
+            region=arguments.get("region", "us"),
+        )
+    elif name == "check_data_freshness":
+        return await gcp_tools.check_data_freshness(
+            table_ref=arguments["table_ref"],
+            stale_hours=arguments.get("stale_hours", 24),
+        )
+    elif name == "detect_schema_drift":
+        return await gcp_tools.detect_schema_drift(
+            table_ref=arguments["table_ref"],
+            expected_schema_json=arguments["expected_schema_json"],
+        )
+    elif name == "suggest_schema_improvements":
+        return await gcp_tools.suggest_schema_improvements(arguments["table_ref"])
+    elif name == "compare_tables":
+        return await gcp_tools.compare_tables(arguments["table_a"], arguments["table_b"])
+    elif name == "list_materialized_views":
+        return await gcp_tools.list_materialized_views(
+            dataset_id=arguments["dataset_id"],
+            project_id=arguments.get("project_id"),
+        )
+    elif name == "explain_query_plan":
+        return await gcp_tools.explain_query_plan(
+            job_id=arguments["job_id"],
+            location=arguments.get("location", "US"),
+        )
+    elif name == "generate_cte_refactor":
+        return _generate_cte_refactor(arguments["sql"])
+    elif name == "suggest_materialized_view":
+        return _suggest_materialized_view(arguments["sql"], arguments.get("dataset_id", "my_dataset"))
 
     else:
         return [types.TextContent(type="text", text=f"Unknown tool: {name}")]
@@ -949,6 +1168,146 @@ def _review_query(sql: str) -> list[types.TextContent]:
         "or `get_practices` with a relevant topic for broader context."
     )
     return [types.TextContent(type="text", text="\n".join(parts))]
+
+
+# ─────────────────────────────────────────────
+# Tool: generate_cte_refactor  (static, no GCP)
+# ─────────────────────────────────────────────
+def _generate_cte_refactor(sql: str) -> list[types.TextContent]:
+    sql_lower = sql.lower()
+    select_count = sql_lower.count("select")
+
+    if select_count <= 1:
+        return [types.TextContent(
+            type="text",
+            text="No nested subqueries detected — this query does not need a CTE refactor.",
+        )]
+
+    if select_count == 2:
+        depth = "one level of nesting"
+        benefit = "moderate"
+    else:
+        depth = f"{select_count - 1} levels of nesting"
+        benefit = "high"
+
+    # Extract fragments heuristically: split on "from (" boundaries
+    fragments = re.split(r"(?i)\bfrom\s*\(", sql)
+
+    lines = [
+        f"## CTE Refactor Suggestion\n",
+        f"Detected {depth} — CTE refactor benefit: **{benefit}**.\n",
+        "### Pattern detected",
+        "```sql",
+        sql[:600] + ("..." if len(sql) > 600 else ""),
+        "```\n",
+        "### Suggested CTE structure",
+        "```sql",
+        "-- Step 1: Name your innermost subquery as a CTE",
+        "WITH",
+        "  base_data AS (",
+        "    -- Move your innermost FROM (...) subquery here",
+        "    SELECT ...",
+        "    FROM your_source_table",
+        "    WHERE ...  -- keep filters close to the source",
+        "  ),",
+        "",
+        "  transformed AS (",
+        "    -- Apply transformations / joins on base_data",
+        "    SELECT ...",
+        "    FROM base_data",
+        "    WHERE ...",
+        "  ),",
+        "",
+        "  aggregated AS (",
+        "    -- Final aggregation or window functions",
+        "    SELECT ...",
+        "    FROM transformed",
+        "    GROUP BY ...",
+        "  )",
+        "",
+        "-- Final SELECT",
+        "SELECT *",
+        "FROM aggregated;",
+        "```\n",
+        "### Why CTEs are better here",
+        "- BigQuery's query planner can optimise each CTE stage independently.",
+        "- Deeply nested subqueries are harder to debug and profile.",
+        "- CTEs make it easier to inspect intermediate results during development.",
+        "- Each CTE is executed once; repeated references don't re-scan.",
+    ]
+    return [types.TextContent(type="text", text="\n".join(lines))]
+
+
+# ─────────────────────────────────────────────
+# Tool: suggest_materialized_view  (static, no GCP)
+# ─────────────────────────────────────────────
+def _suggest_materialized_view(sql: str, dataset_id: str = "my_dataset") -> list[types.TextContent]:
+    sql_lower = sql.lower()
+
+    signals: list[str] = []
+    score = 0
+
+    if "group by" in sql_lower:
+        signals.append("GROUP BY aggregation detected — MVs pre-compute aggregates.")
+        score += 3
+    if re.search(r"\b(sum|avg|count|min|max)\s*\(", sql_lower):
+        signals.append("Aggregate functions detected — ideal for MV pre-computation.")
+        score += 2
+    if "join" in sql_lower:
+        signals.append("JOIN detected — MVs can pre-materialise join results.")
+        score += 2
+    if "where" in sql_lower:
+        signals.append("WHERE filter detected — MV can store the pre-filtered subset.")
+        score += 1
+    if sql_lower.count("select") > 1:
+        signals.append("Nested subqueries detected — MV simplifies the outer query.")
+        score += 1
+
+    if score < 3:
+        return [types.TextContent(
+            type="text",
+            text=(
+                "A Materialized View is unlikely to help significantly for this query.\n\n"
+                "MVs work best for queries with GROUP BY aggregations or expensive JOINs "
+                "that run frequently on the same dataset."
+            ),
+        )]
+
+    recommendation = "highly recommended" if score >= 6 else "recommended" if score >= 4 else "worth considering"
+
+    # Generate a CREATE MV statement (simplified)
+    # Strip trailing semicolon, wrap in CREATE MATERIALIZED VIEW DDL
+    clean_sql = sql.strip().rstrip(";")
+
+    lines = [
+        f"## Materialized View Suggestion\n",
+        f"Recommendation: **{recommendation}** (score: {score}/8)\n",
+        "**Signals:**",
+    ]
+    for s in signals:
+        lines.append(f"  - {s}")
+
+    lines += [
+        "",
+        "### Generated DDL",
+        "```sql",
+        f"CREATE MATERIALIZED VIEW `{dataset_id}.mv_your_view_name`",
+        "OPTIONS (",
+        "  enable_refresh = TRUE,",
+        "  refresh_interval_minutes = 60  -- adjust to your freshness requirements",
+        ")",
+        "AS (",
+        *[f"  {line}" for line in clean_sql.splitlines()],
+        ");",
+        "```\n",
+        "### Important considerations",
+        "- MVs in BigQuery support a [subset of SQL](https://cloud.google.com/bigquery/docs/materialized-views-create#supported-mvs).",
+        "- Queries on source tables will automatically use the MV if the query matches (smart tuning).",
+        "- Set `refresh_interval_minutes` based on your acceptable data staleness.",
+        "- MVs are billed for storage + refresh compute — run `dry_run_query` on the MV SQL first.",
+        "- Use `list_materialized_views` after creation to monitor refresh status.",
+    ]
+    return [types.TextContent(type="text", text="\n".join(lines))]
 
 
 # ─────────────────────────────────────────────

@@ -517,3 +517,541 @@ async def cancel_job(job_id: str, location: str = "US") -> list[types.TextConten
         return _text(f"Cancel request sent for job `{job_id}`.\nCurrent state: {job.state}")
     except Exception as e:
         return _text(f"Cancel job failed: {e}")
+
+
+# ─────────────────────────────────────────────
+# estimate_query_cost
+# ─────────────────────────────────────────────
+async def estimate_query_cost(sql: str, region: str = "US") -> list[types.TextContent]:
+    """Human-friendly cost estimate wrapping dry_run_query."""
+    try:
+        from google.cloud import bigquery as bq
+        client = _client()
+        config = bq.QueryJobConfig(dry_run=True, use_query_cache=False)
+        job = await _run(lambda: client.query(sql, job_config=config))
+        b = job.total_bytes_processed
+        gb = b / 1e9
+        tb = b / 1e12
+        cost = tb * _ON_DEMAND_PRICE_PER_TB
+
+        if cost == 0:
+            tier = "free (no data scanned)"
+        elif cost < 0.01:
+            tier = "negligible (< $0.01)"
+        elif cost < 1:
+            tier = "low (< $1)"
+        elif cost < 10:
+            tier = "moderate ($1–$10)"
+        elif cost < 100:
+            tier = "high ($10–$100) — consider adding partition filters"
+        else:
+            tier = f"very high (${cost:,.2f}) — review query before running"
+
+        lines = [
+            "## Query Cost Estimate\n",
+            f"Data scanned  : {b:,} bytes  ({gb:.3f} GB)",
+            f"Estimated cost: **${cost:.4f} USD**",
+            f"Cost tier     : {tier}",
+            "",
+            "_Pricing: on-demand @ $6.25/TB. Flat-rate / flex slots = $0 per query._",
+        ]
+        if cost > 5:
+            lines += [
+                "",
+                "**Tips to reduce cost:**",
+                "- Add a partition filter (`WHERE _PARTITIONDATE = ...`)",
+                "- Replace `SELECT *` with specific columns",
+                "- Use a WHERE clause to limit rows scanned",
+            ]
+        return _text("\n".join(lines))
+    except Exception as e:
+        return _text(f"Cost estimation failed: {e}")
+
+
+# ─────────────────────────────────────────────
+# get_expensive_queries
+# ─────────────────────────────────────────────
+async def get_expensive_queries(
+    days: int = 7,
+    top_n: int = 10,
+    region: str = "us",
+) -> list[types.TextContent]:
+    """Surface the top N most expensive queries with their SQL snippets."""
+    try:
+        client = _client()
+        project = client.project
+        sql = f"""
+        SELECT
+            job_id,
+            user_email,
+            ROUND(total_bytes_processed / 1e12 * {_ON_DEMAND_PRICE_PER_TB}, 4) AS est_cost_usd,
+            ROUND(total_bytes_processed / 1e9, 2) AS gb_processed,
+            TIMESTAMP_DIFF(end_time, start_time, SECOND) AS duration_sec,
+            creation_time,
+            SUBSTR(query, 1, 500) AS query_snippet
+        FROM `{project}`.`region-{region}`.INFORMATION_SCHEMA.JOBS_BY_PROJECT
+        WHERE
+            creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {days} DAY)
+            AND state = 'DONE'
+            AND job_type = 'QUERY'
+            AND total_bytes_processed IS NOT NULL
+        ORDER BY total_bytes_processed DESC
+        LIMIT {top_n}
+        """
+        rows = await _run(lambda: list(client.query(sql).result()))
+        if not rows:
+            return _text(f"No completed queries found in the last {days} days.")
+
+        lines = [f"# Top {top_n} Most Expensive Queries — Last {days} Days\n"]
+        for i, row in enumerate(rows, 1):
+            created = row.creation_time.strftime("%Y-%m-%d %H:%M") if row.creation_time else "N/A"
+            lines += [
+                f"## {i}. ${row.est_cost_usd:.4f} USD  |  {row.gb_processed:.2f} GB  |  {row.duration_sec}s  |  {created}",
+                f"**User:** {row.user_email}  |  **Job:** `{row.job_id}`",
+                f"```sql\n{row.query_snippet}\n```",
+                "",
+            ]
+        return _text("\n".join(lines))
+    except Exception as e:
+        return _text(f"get_expensive_queries failed: {e}")
+
+
+# ─────────────────────────────────────────────
+# get_slot_utilization
+# ─────────────────────────────────────────────
+async def get_slot_utilization(
+    days: int = 7,
+    region: str = "us",
+) -> list[types.TextContent]:
+    """Slot hours consumed by reservation over the time window."""
+    try:
+        client = _client()
+        project = client.project
+        sql = f"""
+        SELECT
+            reservation_id,
+            COUNT(*) AS job_count,
+            SUM(TIMESTAMP_DIFF(end_time, start_time, SECOND)) AS total_duration_sec,
+            ROUND(SUM(total_slot_ms) / 3600000.0, 2) AS slot_hours
+        FROM `{project}`.`region-{region}`.INFORMATION_SCHEMA.JOBS_BY_PROJECT
+        WHERE
+            creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {days} DAY)
+            AND state = 'DONE'
+            AND total_slot_ms IS NOT NULL
+        GROUP BY reservation_id
+        ORDER BY slot_hours DESC
+        """
+        rows = await _run(lambda: list(client.query(sql).result()))
+        if not rows:
+            return _text(f"No slot data found in the last {days} days.")
+
+        lines = [
+            f"# Slot Utilization — Last {days} Days\n",
+            f"{'Reservation':<45} {'Jobs':>6} {'Slot-Hours':>12} {'Total Duration (h)':>20}",
+            "-" * 90,
+        ]
+        for row in rows:
+            res = row.reservation_id or "(on-demand)"
+            dur_h = (row.total_duration_sec or 0) / 3600
+            lines.append(
+                f"{res:<45} {row.job_count:>6} {row.slot_hours:>12.2f} {dur_h:>20.1f}"
+            )
+        lines.append("\n_Slot-hours = total_slot_ms / 3,600,000. On-demand jobs show as '(on-demand)'._")
+        return _text("\n".join(lines))
+    except Exception as e:
+        return _text(f"Slot utilization query failed: {e}")
+
+
+# ─────────────────────────────────────────────
+# check_data_freshness
+# ─────────────────────────────────────────────
+async def check_data_freshness(
+    table_ref: str,
+    stale_hours: int = 24,
+) -> list[types.TextContent]:
+    """Report how fresh a table is and flag if stale beyond threshold."""
+    try:
+        client = _client()
+        if table_ref.count(".") == 1:
+            table_ref = f"{client.project}.{table_ref}"
+
+        table = await _run(lambda: client.get_table(table_ref))
+        modified = table.modified
+        if not modified:
+            return _text(f"Cannot determine freshness for `{table_ref}` — no modification timestamp available.")
+
+        age = datetime.now(timezone.utc) - modified
+        age_hours = age.total_seconds() / 3600
+        age_str = (
+            f"{int(age.total_seconds() // 60)} minutes"
+            if age_hours < 1
+            else f"{age_hours:.1f} hours"
+            if age_hours < 48
+            else f"{age.days} days"
+        )
+
+        is_stale = age_hours > stale_hours
+        status = "STALE" if is_stale else "FRESH"
+        icon = "WARNING" if is_stale else "OK"
+
+        lines = [
+            f"# Data Freshness: `{table_ref}`\n",
+            f"Status        : [{icon}] {status}",
+            f"Last modified : {modified.strftime('%Y-%m-%d %H:%M UTC')}",
+            f"Age           : {age_str}",
+            f"Threshold     : {stale_hours}h",
+            f"Rows          : {(table.num_rows or 0):,}",
+            f"Size          : {(table.num_bytes or 0) / 1e9:.3f} GB",
+        ]
+
+        if table.time_partitioning:
+            lines.append(
+                f"Partitioned by: {table.time_partitioning.field or '_PARTITIONTIME'} "
+                f"({table.time_partitioning.type_})"
+            )
+
+        if is_stale:
+            lines += [
+                "",
+                f"Table has not been updated in {age_str} — exceeds the {stale_hours}h threshold.",
+                "Check your ingestion pipeline or scheduled query for failures.",
+            ]
+
+        return _text("\n".join(lines))
+    except Exception as e:
+        return _text(f"Data freshness check failed: {e}")
+
+
+# ─────────────────────────────────────────────
+# detect_schema_drift
+# ─────────────────────────────────────────────
+async def detect_schema_drift(
+    table_ref: str,
+    expected_schema_json: str,
+) -> list[types.TextContent]:
+    """Compare expected schema (JSON array of {name, type}) against actual BigQuery schema."""
+    import json
+    try:
+        client = _client()
+        if table_ref.count(".") == 1:
+            table_ref = f"{client.project}.{table_ref}"
+
+        table = await _run(lambda: client.get_table(table_ref))
+        actual = {f.name.lower(): f.field_type.upper() for f in table.schema}
+
+        try:
+            expected_raw = json.loads(expected_schema_json)
+        except json.JSONDecodeError as e:
+            return _text(f"Invalid expected_schema_json: {e}")
+
+        expected = {col["name"].lower(): col["type"].upper() for col in expected_raw}
+
+        missing = {k: v for k, v in expected.items() if k not in actual}
+        extra = {k: v for k, v in actual.items() if k not in expected}
+        type_mismatch = {
+            k: {"expected": expected[k], "actual": actual[k]}
+            for k in expected if k in actual and expected[k] != actual[k]
+        }
+
+        if not missing and not extra and not type_mismatch:
+            return _text(f"No schema drift detected for `{table_ref}` — schemas match.")
+
+        lines = [f"# Schema Drift Report: `{table_ref}`\n"]
+        if missing:
+            lines.append(f"## Missing columns ({len(missing)}) — in expected but not in table")
+            for col, typ in missing.items():
+                lines.append(f"  - `{col}` ({typ})")
+        if extra:
+            lines.append(f"\n## Extra columns ({len(extra)}) — in table but not in expected schema")
+            for col, typ in extra.items():
+                lines.append(f"  + `{col}` ({typ})")
+        if type_mismatch:
+            lines.append(f"\n## Type mismatches ({len(type_mismatch)})")
+            for col, diff in type_mismatch.items():
+                lines.append(f"  `{col}`: expected {diff['expected']}, got {diff['actual']}")
+
+        return _text("\n".join(lines))
+    except Exception as e:
+        return _text(f"Schema drift detection failed: {e}")
+
+
+# ─────────────────────────────────────────────
+# suggest_schema_improvements
+# ─────────────────────────────────────────────
+async def suggest_schema_improvements(table_ref: str) -> list[types.TextContent]:
+    """Pull a table's schema and cross-reference against schema design best practices."""
+    try:
+        client = _client()
+        if table_ref.count(".") == 1:
+            table_ref = f"{client.project}.{table_ref}"
+
+        table = await _run(lambda: client.get_table(table_ref))
+        schema = table.schema
+        suggestions: list[str] = []
+
+        # No partitioning
+        if not table.time_partitioning and not table.range_partitioning:
+            size_gb = (table.num_bytes or 0) / 1e9
+            if size_gb > 1:
+                suggestions.append(
+                    f"[PT-001] Table is {size_gb:.1f} GB with no partitioning. "
+                    "Add DATE/TIMESTAMP partitioning to reduce scan cost."
+                )
+
+        # No clustering
+        if not table.clustering_fields:
+            suggestions.append(
+                "[SD-002] No clustering defined. If queries frequently filter or order by specific columns, "
+                "add up to 4 cluster columns for better pruning."
+            )
+
+        # Columns whose name suggests a date but type is STRING
+        date_name_hints = {"date", "day", "dt", "created", "updated", "timestamp", "ts", "time"}
+        for field in schema:
+            name_lower = field.name.lower()
+            if field.field_type == "STRING" and any(h in name_lower for h in date_name_hints):
+                suggestions.append(
+                    f"[SD-003] Column `{field.name}` is STRING but name suggests a date/time. "
+                    "Consider using DATE, DATETIME, or TIMESTAMP for correct partition pruning and sorting."
+                )
+
+        # NULLABLE columns whose name looks like a primary key
+        pk_hints = {"id", "_id", "key", "_key", "pk"}
+        for field in schema:
+            if field.mode == "NULLABLE" and any(field.name.lower().endswith(h) for h in pk_hints):
+                suggestions.append(
+                    f"[SD-004] Column `{field.name}` appears to be an ID/key but is NULLABLE. "
+                    "If this is a primary key, set mode to REQUIRED."
+                )
+
+        # Very wide table
+        if len(schema) > 50:
+            record_cols = [f for f in schema if f.field_type == "RECORD"]
+            if not record_cols:
+                suggestions.append(
+                    f"[SD-005] Table has {len(schema)} columns with no nested RECORD fields. "
+                    "Consider grouping related columns into STRUCT/RECORD types for clarity and compression."
+                )
+
+        # Repeated fields not using ARRAY type
+        repeated = [f for f in schema if f.mode == "REPEATED"]
+        if not repeated and len(schema) > 20:
+            suggestions.append(
+                "[SD-006] No REPEATED (ARRAY) columns found. "
+                "If any columns represent one-to-many relationships, consider nesting them as ARRAY<STRUCT> "
+                "to avoid expensive JOINs."
+            )
+
+        if not suggestions:
+            return _text(
+                f"No schema improvement suggestions for `{table_ref}`.\n"
+                "Partitioning, clustering, and column types all look reasonable."
+            )
+
+        lines = [f"# Schema Improvement Suggestions: `{table_ref}`\n"]
+        for i, s in enumerate(suggestions, 1):
+            lines.append(f"{i}. {s}")
+        lines.append(
+            "\nUse `get_practice_detail` with any practice ID (e.g. PT-001) for full guidance."
+        )
+        return _text("\n".join(lines))
+    except Exception as e:
+        return _text(f"Schema improvement analysis failed: {e}")
+
+
+# ─────────────────────────────────────────────
+# compare_tables
+# ─────────────────────────────────────────────
+async def compare_tables(table_a: str, table_b: str) -> list[types.TextContent]:
+    """Diff schemas between two BigQuery tables."""
+    try:
+        client = _client()
+
+        def _norm(ref: str) -> str:
+            return f"{client.project}.{ref}" if ref.count(".") == 1 else ref
+
+        t_a, t_b = await asyncio.gather(
+            _run(lambda: client.get_table(_norm(table_a))),
+            _run(lambda: client.get_table(_norm(table_b))),
+        )
+
+        schema_a = {f.name.lower(): f for f in t_a.schema}
+        schema_b = {f.name.lower(): f for f in t_b.schema}
+
+        only_a = {k for k in schema_a if k not in schema_b}
+        only_b = {k for k in schema_b if k not in schema_a}
+        both = {k for k in schema_a if k in schema_b}
+        type_diff = {
+            k for k in both
+            if schema_a[k].field_type != schema_b[k].field_type
+            or schema_a[k].mode != schema_b[k].mode
+        }
+        identical = both - type_diff
+
+        lines = [
+            f"# Schema Comparison\n",
+            f"Table A: `{_norm(table_a)}`  ({len(t_a.schema)} columns, {(t_a.num_bytes or 0)/1e9:.2f} GB)",
+            f"Table B: `{_norm(table_b)}`  ({len(t_b.schema)} columns, {(t_b.num_bytes or 0)/1e9:.2f} GB)\n",
+            f"Identical columns : {len(identical)}",
+            f"Type/mode diffs   : {len(type_diff)}",
+            f"Only in A         : {len(only_a)}",
+            f"Only in B         : {len(only_b)}",
+        ]
+
+        if type_diff:
+            lines.append("\n## Type / Mode Differences")
+            for k in sorted(type_diff):
+                fa, fb = schema_a[k], schema_b[k]
+                lines.append(
+                    f"  `{k}`:  A={fa.field_type}/{fa.mode}  →  B={fb.field_type}/{fb.mode}"
+                )
+
+        if only_a:
+            lines.append(f"\n## Only in A ({len(only_a)})")
+            for k in sorted(only_a):
+                f = schema_a[k]
+                lines.append(f"  - `{k}` ({f.field_type}, {f.mode})")
+
+        if only_b:
+            lines.append(f"\n## Only in B ({len(only_b)})")
+            for k in sorted(only_b):
+                f = schema_b[k]
+                lines.append(f"  + `{k}` ({f.field_type}, {f.mode})")
+
+        # Partition / cluster diff
+        part_a = table_a and (t_a.time_partitioning.field if t_a.time_partitioning else None)
+        part_b = table_b and (t_b.time_partitioning.field if t_b.time_partitioning else None)
+        if part_a != part_b:
+            lines.append(f"\n## Partition column differs: A={part_a or '(none)'}  B={part_b or '(none)'}")
+
+        clust_a = t_a.clustering_fields or []
+        clust_b = t_b.clustering_fields or []
+        if clust_a != clust_b:
+            lines.append(
+                f"\n## Clustering differs:\n  A: {clust_a or '(none)'}  B: {clust_b or '(none)'}"
+            )
+
+        return _text("\n".join(lines))
+    except Exception as e:
+        return _text(f"Table comparison failed: {e}")
+
+
+# ─────────────────────────────────────────────
+# list_materialized_views
+# ─────────────────────────────────────────────
+async def list_materialized_views(dataset_id: str, project_id: str | None = None) -> list[types.TextContent]:
+    """List all materialized views in a dataset with refresh status."""
+    try:
+        client = _client()
+        project = project_id or client.project
+
+        tables = await _run(lambda: list(client.list_tables(f"{project}.{dataset_id}")))
+        mvs = [t for t in tables if t.table_type == "MATERIALIZED_VIEW"]
+
+        if not mvs:
+            return _text(f"No materialized views found in `{project}.{dataset_id}`.")
+
+        # Get full details for each MV
+        async def _get(t):
+            return await _run(lambda: client.get_table(t.reference))
+
+        full = await asyncio.gather(*[_get(t) for t in mvs])
+
+        lines = [f"# Materialized Views in `{project}.{dataset_id}`\n"]
+        for t in full:
+            mv_def = getattr(t, "mview_query", None) or "(query not available)"
+            last_refresh = getattr(t, "mview_last_refresh_time", None)
+            enable_refresh = getattr(t, "mview_enable_refresh", None)
+            refresh_interval = getattr(t, "mview_refresh_interval", None)
+
+            refresh_str = last_refresh.strftime("%Y-%m-%d %H:%M UTC") if last_refresh else "Never"
+            age_str = ""
+            if last_refresh:
+                age_h = (datetime.now(timezone.utc) - last_refresh).total_seconds() / 3600
+                age_str = f"({age_h:.1f}h ago)"
+
+            lines += [
+                f"## {t.table_id}",
+                f"Last refreshed : {refresh_str} {age_str}",
+                f"Auto-refresh   : {enable_refresh}",
+                f"Refresh interval: {refresh_interval or 'N/A'}",
+                f"Size           : {(t.num_bytes or 0) / 1e9:.3f} GB",
+                f"```sql\n{str(mv_def)[:400]}\n```",
+                "",
+            ]
+        return _text("\n".join(lines))
+    except Exception as e:
+        return _text(f"List materialized views failed: {e}")
+
+
+# ─────────────────────────────────────────────
+# explain_query_plan
+# ─────────────────────────────────────────────
+async def explain_query_plan(job_id: str, location: str = "US") -> list[types.TextContent]:
+    """Parse the query execution plan from a completed job and surface bottlenecks."""
+    try:
+        client = _client()
+        job = await _run(lambda: client.get_job(job_id, location=location))
+
+        if not hasattr(job, "query_plan") or not job.query_plan:
+            return _text(
+                f"No query plan available for job `{job_id}`. "
+                "The job may still be running, or may not be a query job."
+            )
+
+        plan = job.query_plan
+        total_compute_ms = sum(
+            (stage.compute_ms_avg or 0) for stage in plan
+        )
+
+        lines = [
+            f"# Query Execution Plan: `{job_id}`\n",
+            f"Total stages : {len(plan)}",
+            f"Total compute: ~{total_compute_ms:,} ms\n",
+            f"{'Stage':<30} {'Status':<12} {'Records In':>14} {'Records Out':>14} {'Compute (ms)':>14} {'Inputs':>8}",
+            "-" * 100,
+        ]
+
+        bottlenecks = []
+        for stage in plan:
+            rec_in = stage.records_read or 0
+            rec_out = stage.records_written or 0
+            compute = stage.compute_ms_avg or 0
+            inputs = stage.parallel_inputs or 0
+
+            lines.append(
+                f"{stage.name:<30} {stage.status:<12} {rec_in:>14,} {rec_out:>14,} {compute:>14,} {inputs:>8}"
+            )
+
+            # Flag bottlenecks
+            if total_compute_ms > 0 and compute / total_compute_ms > 0.5:
+                bottlenecks.append(
+                    f"Stage `{stage.name}` consumes {compute/total_compute_ms*100:.0f}% of total compute time."
+                )
+            if rec_in > 0 and rec_out / rec_in < 0.01:
+                bottlenecks.append(
+                    f"Stage `{stage.name}` filters out 99%+ of records ({rec_in:,} → {rec_out:,}). "
+                    "Moving this filter earlier (or using partition/cluster pruning) could reduce cost."
+                )
+
+            # Show meaningful steps
+            if stage.steps:
+                step_summary = ", ".join(
+                    s.kind for s in stage.steps[:6] if s.kind
+                )
+                if step_summary:
+                    lines.append(f"  Steps: {step_summary}")
+
+        if bottlenecks:
+            lines.append("\n## Bottlenecks Detected")
+            for b in bottlenecks:
+                lines.append(f"  - {b}")
+
+        billed_gb = (getattr(job, "total_bytes_billed", None) or 0) / 1e9
+        processed_gb = (getattr(job, "total_bytes_processed", None) or 0) / 1e9
+        if processed_gb:
+            lines.append(f"\n**Bytes processed:** {processed_gb:.3f} GB  |  **Bytes billed:** {billed_gb:.3f} GB")
+
+        return _text("\n".join(lines))
+    except Exception as e:
+        return _text(f"explain_query_plan failed: {e}")
