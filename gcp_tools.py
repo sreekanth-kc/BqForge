@@ -1,5 +1,5 @@
 """
-GCP-powered QostEx tools.
+GCP-powered BqForge tools.
 
 All public coroutines return list[types.TextContent] matching the MCP contract.
 Blocking BigQuery SDK calls are dispatched to a thread pool via asyncio.to_thread.

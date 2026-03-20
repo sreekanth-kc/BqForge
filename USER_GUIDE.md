@@ -1,18 +1,18 @@
-# QostEx — User Guide
+# BqForge — User Guide
 
-> Everything you need to install, configure, and use QostEx in Claude Desktop or any MCP-compatible client.
+> Everything you need to install, configure, and use BqForge in Claude Desktop or any MCP-compatible client.
 
 ---
 
 ## Table of Contents
 
-1. [What is QostEx?](#what-is-qostex)
+1. [What is BqForge?](#what-is-bqforge)
 2. [Prerequisites](#prerequisites)
 3. [Installation](#installation)
 4. [Connecting to Claude Desktop](#connecting-to-claude-desktop)
 5. [GCP Authentication Setup](#gcp-authentication-setup)
 6. [Verifying the Setup](#verifying-the-setup)
-7. [Using QostEx — Workflow Guide](#using-qostex--workflow-guide)
+7. [Using BqForge — Workflow Guide](#using-bqforge--workflow-guide)
    - [No-GCP Mode (Best Practices Only)](#no-gcp-mode-best-practices-only)
    - [GCP Mode (Live Tools)](#gcp-mode-live-tools)
 8. [Tool-by-Tool Usage Examples](#tool-by-tool-usage-examples)
@@ -22,9 +22,9 @@
 
 ---
 
-## What is QostEx?
+## What is BqForge?
 
-QostEx is a **Model Context Protocol (MCP) server** that gives Claude (and other AI assistants) deep BigQuery intelligence:
+BqForge is a **Model Context Protocol (MCP) server** that gives Claude (and other AI assistants) deep BigQuery intelligence:
 
 - **Best-practice knowledge base** — 81 curated practices across 13 categories, searchable and token-budgeted
 - **SQL reviewer** — static linting with auto-fix suggestions, comment-aware
@@ -55,7 +55,7 @@ For GCP tools (optional):
 
 ```bash
 git clone https://github.com/sreekanth-kc/BqForge.git
-cd QostEx
+cd BqForge
 ```
 
 ### 2. Create a virtual environment and install dependencies
@@ -87,30 +87,30 @@ You should see the server start and wait for input. Press `Ctrl+C` to stop. If i
 | macOS | `~/Library/Application Support/Claude/claude_desktop_config.json` |
 | Windows | `%APPDATA%\Claude\claude_desktop_config.json` |
 
-### Step 2 — Add QostEx to the config
+### Step 2 — Add BqForge to the config
 
-Open the file and add the `qostex` entry under `mcpServers`:
+Open the file and add the `bqforge` entry under `mcpServers`:
 
 ```json
 {
   "mcpServers": {
-    "qostex": {
-      "command": "/absolute/path/to/QostEx/.venv/bin/python3",
-      "args": ["/absolute/path/to/QostEx/server.py"]
+    "bqforge": {
+      "command": "/absolute/path/to/BqForge/.venv/bin/python3",
+      "args": ["/absolute/path/to/BqForge/server.py"]
     }
   }
 }
 ```
 
-**Important:** Use absolute paths. Replace `/absolute/path/to/QostEx` with your actual path.
+**Important:** Use absolute paths. Replace `/absolute/path/to/BqForge` with your actual path.
 
 **Example on macOS:**
 ```json
 {
   "mcpServers": {
-    "qostex": {
-      "command": "/Users/yourname/QostEx/.venv/bin/python3",
-      "args": ["/Users/yourname/QostEx/server.py"]
+    "bqforge": {
+      "command": "/Users/yourname/BqForge/.venv/bin/python3",
+      "args": ["/Users/yourname/BqForge/server.py"]
     }
   }
 }
@@ -118,13 +118,13 @@ Open the file and add the `qostex` entry under `mcpServers`:
 
 ### Step 3 — Restart Claude Desktop
 
-Fully quit and reopen Claude Desktop. QostEx tools will appear in the tool list.
+Fully quit and reopen Claude Desktop. BqForge tools will appear in the tool list.
 
 ---
 
 ## GCP Authentication Setup
 
-QostEx tries credentials in this priority order:
+BqForge tries credentials in this priority order:
 
 | Priority | Method | Best for |
 |---|---|---|
@@ -144,11 +144,11 @@ QostEx tries credentials in this priority order:
 ```json
 {
   "mcpServers": {
-    "qostex": {
-      "command": "/Users/yourname/QostEx/.venv/bin/python3",
-      "args": ["/Users/yourname/QostEx/server.py"],
+    "bqforge": {
+      "command": "/Users/yourname/BqForge/.venv/bin/python3",
+      "args": ["/Users/yourname/BqForge/server.py"],
       "env": {
-        "GCP_SERVICE_ACCOUNT_JSON": "{\"type\":\"service_account\",\"project_id\":\"my-project\",\"private_key_id\":\"...\",\"private_key\":\"-----BEGIN RSA PRIVATE KEY-----\\n...\\n-----END RSA PRIVATE KEY-----\\n\",\"client_email\":\"qostex@my-project.iam.gserviceaccount.com\", ...}"
+        "GCP_SERVICE_ACCOUNT_JSON": "{\"type\":\"service_account\",\"project_id\":\"my-project\",\"private_key_id\":\"...\",\"private_key\":\"-----BEGIN RSA PRIVATE KEY-----\\n...\\n-----END RSA PRIVATE KEY-----\\n\",\"client_email\":\"bqforge@my-project.iam.gserviceaccount.com\", ...}"
       }
     }
   }
@@ -166,9 +166,9 @@ QostEx tries credentials in this priority order:
 ```json
 {
   "mcpServers": {
-    "qostex": {
-      "command": "/Users/yourname/QostEx/.venv/bin/python3",
-      "args": ["/Users/yourname/QostEx/server.py"],
+    "bqforge": {
+      "command": "/Users/yourname/BqForge/.venv/bin/python3",
+      "args": ["/Users/yourname/BqForge/server.py"],
       "env": {
         "GOOGLE_APPLICATION_CREDENTIALS": "/Users/yourname/keys/sa-key.json"
       }
@@ -192,7 +192,7 @@ No env vars needed — the SDK picks up ADC automatically. This only works on yo
 After restarting Claude Desktop, ask:
 
 ```
-Check my GCP connection using QostEx
+Check my GCP connection using BqForge
 ```
 
 Claude will call `check_gcp_connection`. You should see:
@@ -206,7 +206,7 @@ If you see an error, check the [Troubleshooting](#troubleshooting) section.
 
 ---
 
-## Using QostEx — Workflow Guide
+## Using BqForge — Workflow Guide
 
 ### No-GCP Mode (Best Practices Only)
 
@@ -235,13 +235,13 @@ Claude will call `review_query` and return numbered findings with SQL fix snippe
 #### Search for a specific practice
 
 ```
-Search QostEx practices for "clustering"
+Search BqForge practices for "clustering"
 ```
 
 #### Get all practices for a category
 
 ```
-Show me all schema design practices from QostEx
+Show me all schema design practices from BqForge
 ```
 
 ---
@@ -396,10 +396,10 @@ Explain the execution plan for job ID bqjob_r123abc456_00000190abc_1
 
 ## Auto-Activate via System Prompt
 
-Instead of mentioning QostEx in every message, paste this into your **Claude Project Instructions** (Claude Desktop → Project → Instructions):
+Instead of mentioning BqForge in every message, paste this into your **Claude Project Instructions** (Claude Desktop → Project → Instructions):
 
 ```
-You have access to the QostEx MCP server for BigQuery best practices and live GCP tools.
+You have access to the BqForge MCP server for BigQuery best practices and live GCP tools.
 
 When the user asks about BigQuery topics, writing queries, optimizing cost, or reviewing SQL:
 1. Call resolve_topic(query="<topic>") to find relevant practice IDs
@@ -414,7 +414,7 @@ When the user asks about cost, schema, or job history:
 - Use the appropriate GCP live tool (estimate_query_cost, explore_schema, get_expensive_queries, etc.)
 ```
 
-After this, Claude will automatically use QostEx tools whenever BigQuery topics come up — no manual prompting needed.
+After this, Claude will automatically use BqForge tools whenever BigQuery topics come up — no manual prompting needed.
 
 ---
 
@@ -431,9 +431,9 @@ After this, Claude will automatically use QostEx tools whenever BigQuery topics 
 ```json
 {
   "mcpServers": {
-    "qostex": {
-      "command": "/Users/yourname/QostEx/.venv/bin/python3",
-      "args": ["/Users/yourname/QostEx/server.py"],
+    "bqforge": {
+      "command": "/Users/yourname/BqForge/.venv/bin/python3",
+      "args": ["/Users/yourname/BqForge/server.py"],
       "env": {
         "GCP_SERVICE_ACCOUNT_JSON": "{...}",
         "BQ_PRICE_PER_TB": "6.25"
@@ -447,7 +447,7 @@ After this, Claude will automatically use QostEx tools whenever BigQuery topics 
 
 ## Troubleshooting
 
-### QostEx tools don't appear in Claude Desktop
+### BqForge tools don't appear in Claude Desktop
 
 1. Check that `claude_desktop_config.json` is valid JSON (paste it into [jsonlint.com](https://jsonlint.com))
 2. Make sure you used **absolute paths** — relative paths don't work in MCP config

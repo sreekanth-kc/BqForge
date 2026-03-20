@@ -1,5 +1,5 @@
 """
-Lightweight SQL parsing utilities for QostEx.
+Lightweight SQL parsing utilities for BqForge.
 Uses sqlparse for reliable comment stripping and normalization,
 then focused regex for pattern extraction.
 """
