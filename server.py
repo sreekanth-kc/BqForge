@@ -28,6 +28,8 @@ from data.workload_management import WORKLOAD_MANAGEMENT
 from data.partitioning import PARTITIONING
 from data.bi_engine import BI_ENGINE
 from data.storage_pricing import STORAGE_PRICING
+from data.authorized_views import AUTHORIZED_VIEWS
+from data.scheduled_queries import SCHEDULED_QUERIES
 
 ALL_PRACTICES: dict[str, dict] = {
     "query_optimization": QUERY_OPTIMIZATION,
@@ -41,6 +43,8 @@ ALL_PRACTICES: dict[str, dict] = {
     "partitioning": PARTITIONING,
     "bi_engine": BI_ENGINE,
     "storage_pricing": STORAGE_PRICING,
+    "authorized_views": AUTHORIZED_VIEWS,
+    "scheduled_queries": SCHEDULED_QUERIES,
 }
 
 # Pre-built flat index: id → (category, practice_dict)
@@ -624,6 +628,84 @@ async def list_tools() -> list[types.Tool]:
                 "required": ["sql"],
             },
         ),
+        types.Tool(
+            name="detect_zombie_queries",
+            description=(
+                "Find recurring unlabeled queries ('zombie jobs') — scheduled or automated queries "
+                "with no owner labels that accumulate cost without accountability. "
+                "Returns query snippets, run counts, and total estimated cost."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "days": {"type": "integer", "description": "Lookback window in days (default 30).", "default": 30},
+                    "min_runs": {"type": "integer", "description": "Minimum runs to qualify as recurring (default 5).", "default": 5},
+                    "region": {"type": "string", "description": "BQ region slug (default 'us').", "default": "us"},
+                },
+            },
+        ),
+        types.Tool(
+            name="map_table_lineage",
+            description=(
+                "Build a dependency graph for a table by parsing SQL from job history. "
+                "Returns upstream tables (feeds into this table) and downstream tables (read from this table). "
+                "No Dataplex or dbt required."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "table_ref": {"type": "string", "description": "Table reference: project.dataset.table or dataset.table"},
+                    "days": {"type": "integer", "description": "Lookback window in days (default 30).", "default": 30},
+                    "region": {"type": "string", "description": "BQ region slug (default 'us').", "default": "us"},
+                    "direction": {
+                        "type": "string",
+                        "enum": ["upstream", "downstream", "both"],
+                        "description": "Which direction to map (default 'both').",
+                        "default": "both",
+                    },
+                },
+                "required": ["table_ref"],
+            },
+        ),
+        types.Tool(
+            name="detect_performance_regression",
+            description=(
+                "Compare query performance between a recent window and a baseline window. "
+                "Flags queries where bytes processed or duration have increased by 30%+. "
+                "Answers: 'this query was fast last week — what changed?'"
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "days_recent": {"type": "integer", "description": "Size of the recent window in days (default 7).", "default": 7},
+                    "days_baseline": {"type": "integer", "description": "Size of the baseline window in days (default 7).", "default": 7},
+                    "min_runs": {"type": "integer", "description": "Minimum runs required in each window (default 3).", "default": 3},
+                    "region": {"type": "string", "description": "BQ region slug (default 'us').", "default": "us"},
+                },
+            },
+        ),
+        types.Tool(
+            name="nl_to_sql",
+            description=(
+                "Fetch real schema for a dataset/tables and return structured schema context "
+                "grounded in actual column names, partition keys, and clustering fields — "
+                "enabling accurate BigQuery SQL generation from a natural language description."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "description": {"type": "string", "description": "Natural language description of the query you want, e.g. 'get total revenue per country for last 30 days'."},
+                    "dataset_id": {"type": "string", "description": "Dataset to pull schema from."},
+                    "table_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Specific table names within the dataset (optional; if omitted, first 10 tables are fetched).",
+                    },
+                    "project_id": {"type": "string", "description": "GCP project (defaults to authenticated project)."},
+                },
+                "required": ["description"],
+            },
+        ),
     ]
 
 
@@ -736,6 +818,33 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         return _generate_cte_refactor(arguments["sql"])
     elif name == "suggest_materialized_view":
         return _suggest_materialized_view(arguments["sql"], arguments.get("dataset_id", "my_dataset"))
+    elif name == "detect_zombie_queries":
+        return await gcp_tools.detect_zombie_queries(
+            days=arguments.get("days", 30),
+            min_runs=arguments.get("min_runs", 5),
+            region=arguments.get("region", "us"),
+        )
+    elif name == "map_table_lineage":
+        return await gcp_tools.map_table_lineage(
+            table_ref=arguments["table_ref"],
+            days=arguments.get("days", 30),
+            region=arguments.get("region", "us"),
+            direction=arguments.get("direction", "both"),
+        )
+    elif name == "detect_performance_regression":
+        return await gcp_tools.detect_performance_regression(
+            days_recent=arguments.get("days_recent", 7),
+            days_baseline=arguments.get("days_baseline", 7),
+            min_runs=arguments.get("min_runs", 3),
+            region=arguments.get("region", "us"),
+        )
+    elif name == "nl_to_sql":
+        return await gcp_tools.nl_to_sql(
+            description=arguments["description"],
+            dataset_id=arguments.get("dataset_id"),
+            table_ids=arguments.get("table_ids"),
+            project_id=arguments.get("project_id"),
+        )
 
     else:
         return [types.TextContent(type="text", text=f"Unknown tool: {name}")]

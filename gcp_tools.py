@@ -6,6 +6,9 @@ Blocking BigQuery SDK calls are dispatched to a thread pool via asyncio.to_threa
 """
 
 import asyncio
+import hashlib
+import json
+import re
 from datetime import datetime, timezone
 
 from mcp import types
@@ -1055,3 +1058,444 @@ async def explain_query_plan(job_id: str, location: str = "US") -> list[types.Te
         return _text("\n".join(lines))
     except Exception as e:
         return _text(f"explain_query_plan failed: {e}")
+
+
+# ─────────────────────────────────────────────
+# detect_zombie_queries
+# ─────────────────────────────────────────────
+def _normalize_sql(sql: str) -> str:
+    """Strip literals and whitespace for stable query fingerprinting."""
+    s = sql.lower()
+    s = re.sub(r"'[^']*'", "'?'", s)       # string literals
+    s = re.sub(r"\b\d+\b", "?", s)          # numeric literals
+    s = re.sub(r"--[^\n]*", "", s)           # line comments
+    s = re.sub(r"/\*.*?\*/", "", s, flags=re.DOTALL)  # block comments
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+async def detect_zombie_queries(
+    days: int = 30,
+    min_runs: int = 5,
+    region: str = "us",
+) -> list[types.TextContent]:
+    """
+    Find recurring queries with no owner labels — 'zombie' scheduled queries
+    that run automatically, accumulate cost, and have no clear accountability.
+    """
+    try:
+        client = _client()
+        project = client.project
+
+        sql = f"""
+        SELECT
+            SUBSTR(query, 1, 600) AS query_snippet,
+            user_email,
+            COUNT(*) AS run_count,
+            ROUND(SUM(total_bytes_processed) / 1e12 * {_ON_DEMAND_PRICE_PER_TB}, 4) AS total_cost_usd,
+            ROUND(AVG(total_bytes_processed) / 1e9, 2) AS avg_gb_per_run,
+            MIN(creation_time) AS first_seen,
+            MAX(creation_time) AS last_seen,
+            ARRAY_LENGTH(labels) AS label_count
+        FROM `{project}`.`region-{region}`.INFORMATION_SCHEMA.JOBS_BY_PROJECT
+        WHERE
+            creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {days} DAY)
+            AND state = 'DONE'
+            AND job_type = 'QUERY'
+            AND error_result IS NULL
+            AND query IS NOT NULL
+            AND ARRAY_LENGTH(labels) = 0
+        GROUP BY query_snippet, user_email, label_count
+        HAVING run_count >= {min_runs}
+        ORDER BY total_cost_usd DESC
+        LIMIT 25
+        """
+
+        rows = await _run(lambda: list(client.query(sql).result()))
+
+        if not rows:
+            return _text(
+                f"No zombie queries detected in the last {days} days "
+                f"(no unlabeled queries ran {min_runs}+ times)."
+            )
+
+        total_waste = sum(float(r.total_cost_usd or 0) for r in rows)
+
+        lines = [
+            f"# Zombie Query Report — Last {days} Days\n",
+            f"Found **{len(rows)}** recurring unlabeled queries.",
+            f"Total estimated cost: **${total_waste:.2f} USD**\n",
+            f"{'Runs':>5} {'Cost (USD)':>12} {'Avg GB':>8} {'User':<35} {'Last Seen':<18}",
+            "-" * 85,
+        ]
+
+        for row in rows:
+            last = row.last_seen.strftime("%Y-%m-%d %H:%M") if row.last_seen else "N/A"
+            lines.append(
+                f"{row.run_count:>5} ${float(row.total_cost_usd or 0):>11.4f} "
+                f"{float(row.avg_gb_per_run or 0):>8.2f} {row.user_email:<35} {last:<18}"
+            )
+            lines.append(f"  ```sql\n  {row.query_snippet[:200].strip()}\n  ```")
+            lines.append("")
+
+        lines += [
+            "---",
+            "**Recommended actions:**",
+            "- Add labels (`owner`, `pipeline`, `team`) to each query — see practice SQ-001.",
+            "- Decommission queries that are no longer needed.",
+            "- Move high-cost recurring queries to Dataform for proper lifecycle management.",
+        ]
+        return _text("\n".join(lines))
+    except Exception as e:
+        return _text(f"Zombie query detection failed: {e}")
+
+
+# ─────────────────────────────────────────────
+# map_table_lineage
+# ─────────────────────────────────────────────
+async def map_table_lineage(
+    table_ref: str,
+    days: int = 30,
+    region: str = "us",
+    direction: str = "both",  # upstream | downstream | both
+) -> list[types.TextContent]:
+    """
+    Parse SQL from job history to build a dependency graph for a table.
+    upstream  = what tables does this table read from?
+    downstream = what tables read from this table?
+    """
+    try:
+        client = _client()
+        project = client.project
+
+        if table_ref.count(".") == 1:
+            table_ref = f"{project}.{table_ref}"
+
+        # Normalise for matching: strip project prefix for pattern matching
+        parts = table_ref.split(".")
+        table_short = ".".join(parts[-2:])   # dataset.table
+        table_full = table_ref
+
+        sql = f"""
+        SELECT
+            job_id,
+            user_email,
+            creation_time,
+            SUBSTR(query, 1, 2000) AS query_text,
+            ARRAY(
+              SELECT CONCAT(t.project_id, '.', t.dataset_id, '.', t.table_id)
+              FROM UNNEST(referenced_tables) AS t
+            ) AS source_tables,
+            destination_table
+        FROM `{project}`.`region-{region}`.INFORMATION_SCHEMA.JOBS_BY_PROJECT
+        WHERE
+            creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {days} DAY)
+            AND state = 'DONE'
+            AND job_type = 'QUERY'
+            AND query IS NOT NULL
+            AND (
+                query LIKE '%{table_short}%'
+                OR CAST(destination_table AS STRING) LIKE '%{table_short}%'
+            )
+        LIMIT 200
+        """
+
+        rows = await _run(lambda: list(client.query(sql).result()))
+
+        if not rows:
+            return _text(
+                f"No lineage data found for `{table_ref}` in the last {days} days.\n"
+                "The table may not have been referenced in any recent jobs."
+            )
+
+        upstream: dict[str, int] = {}    # tables that feed INTO target
+        downstream: dict[str, int] = {}  # tables that are written FROM target
+
+        for row in rows:
+            sources = list(row.source_tables or [])
+            dest = row.destination_table
+
+            # Normalise destination
+            dest_str = ""
+            if dest and hasattr(dest, "project_id"):
+                dest_str = f"{dest.project_id}.{dest.dataset_id}.{dest.table_id}"
+
+            target_is_source = any(table_short in s for s in sources) or table_full in sources
+            target_is_dest = table_short in dest_str or table_full in dest_str
+
+            if target_is_dest:
+                # Something writes TO our table — sources are upstream
+                for s in sources:
+                    if s and table_short not in s:
+                        upstream[s] = upstream.get(s, 0) + 1
+
+            if target_is_source:
+                # Our table is read, destination is downstream
+                if dest_str and table_short not in dest_str:
+                    downstream[dest_str] = downstream.get(dest_str, 0) + 1
+
+        lines = [f"# Table Lineage: `{table_ref}`\n", f"Analysis window: last {days} days\n"]
+
+        if direction in ("upstream", "both") and upstream:
+            lines.append(f"## Upstream (feeds into `{table_short}`)")
+            lines.append(f"{'Table':<65} {'Job count':>10}")
+            lines.append("-" * 78)
+            for t, cnt in sorted(upstream.items(), key=lambda x: -x[1]):
+                lines.append(f"  {t:<65} {cnt:>10}")
+            lines.append("")
+
+        if direction in ("downstream", "both") and downstream:
+            lines.append(f"## Downstream (reads from `{table_short}`)")
+            lines.append(f"{'Table':<65} {'Job count':>10}")
+            lines.append("-" * 78)
+            for t, cnt in sorted(downstream.items(), key=lambda x: -x[1]):
+                lines.append(f"  {t:<65} {cnt:>10}")
+            lines.append("")
+
+        if not upstream and not downstream:
+            lines.append(
+                f"No upstream or downstream dependencies found for `{table_ref}` in the last {days} days.\n"
+                "The table may be a root source or may not have been used recently."
+            )
+
+        lines.append(
+            "_Lineage is derived from INFORMATION_SCHEMA.JOBS SQL text and referenced_tables. "
+            "It reflects query-time dependencies, not physical data movement._"
+        )
+        return _text("\n".join(lines))
+    except Exception as e:
+        return _text(f"Table lineage mapping failed: {e}")
+
+
+# ─────────────────────────────────────────────
+# detect_performance_regression
+# ─────────────────────────────────────────────
+async def detect_performance_regression(
+    days_recent: int = 7,
+    days_baseline: int = 7,
+    min_runs: int = 3,
+    region: str = "us",
+) -> list[types.TextContent]:
+    """
+    Compare query performance between a recent window and a baseline window.
+    Flags queries where bytes processed or duration have significantly increased.
+    """
+    try:
+        client = _client()
+        project = client.project
+
+        # Fetch both windows in one query, split by period
+        sql = f"""
+        WITH windowed AS (
+            SELECT
+                MD5(REGEXP_REPLACE(LOWER(query), r'\\s+', ' ')) AS query_hash,
+                SUBSTR(query, 1, 300) AS query_snippet,
+                CASE
+                    WHEN creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {days_recent} DAY)
+                    THEN 'recent'
+                    ELSE 'baseline'
+                END AS period,
+                total_bytes_processed,
+                TIMESTAMP_DIFF(end_time, start_time, MILLISECOND) AS duration_ms,
+                total_slot_ms
+            FROM `{project}`.`region-{region}`.INFORMATION_SCHEMA.JOBS_BY_PROJECT
+            WHERE
+                creation_time >= TIMESTAMP_SUB(
+                    CURRENT_TIMESTAMP(),
+                    INTERVAL {days_recent + days_baseline} DAY
+                )
+                AND state = 'DONE'
+                AND job_type = 'QUERY'
+                AND error_result IS NULL
+                AND total_bytes_processed IS NOT NULL
+                AND query NOT LIKE '%INFORMATION_SCHEMA%'
+        ),
+        aggregated AS (
+            SELECT
+                query_hash,
+                ANY_VALUE(query_snippet) AS query_snippet,
+                period,
+                COUNT(*) AS run_count,
+                AVG(total_bytes_processed) AS avg_bytes,
+                AVG(duration_ms) AS avg_duration_ms,
+                AVG(total_slot_ms) AS avg_slot_ms
+            FROM windowed
+            GROUP BY query_hash, period
+            HAVING run_count >= {min_runs}
+        ),
+        compared AS (
+            SELECT
+                r.query_hash,
+                r.query_snippet,
+                r.run_count AS recent_runs,
+                b.run_count AS baseline_runs,
+                r.avg_bytes AS recent_bytes,
+                b.avg_bytes AS baseline_bytes,
+                r.avg_duration_ms AS recent_dur_ms,
+                b.avg_duration_ms AS baseline_dur_ms,
+                SAFE_DIVIDE(r.avg_bytes, b.avg_bytes) AS bytes_ratio,
+                SAFE_DIVIDE(r.avg_duration_ms, b.avg_duration_ms) AS dur_ratio
+            FROM aggregated r
+            JOIN aggregated b USING (query_hash)
+            WHERE r.period = 'recent' AND b.period = 'baseline'
+        )
+        SELECT *
+        FROM compared
+        WHERE bytes_ratio > 1.3 OR dur_ratio > 1.3  -- flag 30%+ regression
+        ORDER BY bytes_ratio DESC
+        LIMIT 20
+        """
+
+        rows = await _run(lambda: list(client.query(sql).result()))
+
+        if not rows:
+            return _text(
+                f"No performance regressions detected.\n"
+                f"Compared last {days_recent}d vs prior {days_baseline}d "
+                f"(minimum {min_runs} runs required in each window)."
+            )
+
+        lines = [
+            f"# Performance Regression Report\n",
+            f"Recent window : last {days_recent} days",
+            f"Baseline      : {days_recent}–{days_recent + days_baseline} days ago",
+            f"Min runs      : {min_runs} per window\n",
+            f"Found **{len(rows)}** regressing queries.\n",
+        ]
+
+        for i, row in enumerate(rows, 1):
+            bytes_pct = (float(row.bytes_ratio or 1) - 1) * 100
+            dur_pct = (float(row.dur_ratio or 1) - 1) * 100
+            recent_gb = float(row.recent_bytes or 0) / 1e9
+            baseline_gb = float(row.baseline_bytes or 0) / 1e9
+            recent_s = float(row.recent_dur_ms or 0) / 1000
+            baseline_s = float(row.baseline_dur_ms or 0) / 1000
+
+            severity = "CRITICAL" if bytes_pct > 100 or dur_pct > 100 else "WARNING"
+
+            lines += [
+                f"## {i}. [{severity}] Bytes +{bytes_pct:.0f}%  |  Duration +{dur_pct:.0f}%",
+                f"Recent: {recent_gb:.2f} GB / {recent_s:.1f}s  |  "
+                f"Baseline: {baseline_gb:.2f} GB / {baseline_s:.1f}s",
+                f"Runs: {row.recent_runs} recent vs {row.baseline_runs} baseline",
+                f"```sql\n{row.query_snippet}\n```",
+                "",
+            ]
+
+        lines += [
+            "---",
+            "**Common causes of regression:**",
+            "- Table growth without corresponding partition filter",
+            "- Schema change adding columns scanned by SELECT *",
+            "- New JOIN to a large table added in a pipeline update",
+            "- Partition filter removed or broken after a refactor",
+        ]
+        return _text("\n".join(lines))
+    except Exception as e:
+        return _text(f"Performance regression detection failed: {e}")
+
+
+# ─────────────────────────────────────────────
+# nl_to_sql
+# ─────────────────────────────────────────────
+async def nl_to_sql(
+    description: str,
+    dataset_id: str | None = None,
+    table_ids: list[str] | None = None,
+    project_id: str | None = None,
+) -> list[types.TextContent]:
+    """
+    Fetch real schema for the referenced tables and return structured context
+    so the AI can generate accurate, grounded BigQuery SQL.
+    """
+    try:
+        client = _client()
+        project = project_id or client.project
+
+        schema_context: list[str] = []
+
+        if dataset_id:
+            # If specific tables provided, use them; otherwise list the dataset
+            if table_ids:
+                tables_to_fetch = [
+                    f"{project}.{dataset_id}.{t}" for t in table_ids
+                ]
+            else:
+                all_tables = await _run(
+                    lambda: list(client.list_tables(f"{project}.{dataset_id}"))
+                )
+                tables_to_fetch = [
+                    f"{project}.{dataset_id}.{t.table_id}"
+                    for t in all_tables[:10]  # cap at 10 tables
+                ]
+
+            for tref in tables_to_fetch:
+                try:
+                    table = await _run(lambda: client.get_table(tref))
+                    cols = []
+                    for f in table.schema:
+                        desc = f" -- {f.description}" if f.description else ""
+                        cols.append(f"    {f.name} {f.field_type} ({f.mode}){desc}")
+
+                    part_info = ""
+                    if table.time_partitioning:
+                        col = table.time_partitioning.field or "_PARTITIONTIME"
+                        part_info = f"  -- Partitioned by: {col} ({table.time_partitioning.type_})"
+
+                    clust_info = ""
+                    if table.clustering_fields:
+                        clust_info = f"  -- Clustered by: {', '.join(table.clustering_fields)}"
+
+                    schema_context.append(
+                        f"TABLE `{tref}`{part_info}{clust_info}\n"
+                        + "\n".join(cols)
+                    )
+                except Exception:
+                    schema_context.append(f"TABLE `{tref}` -- (schema unavailable)")
+
+        if not schema_context:
+            return _text(
+                "No schema context available. Provide dataset_id (and optionally table_ids) "
+                "so BqForge can ground the SQL in real column names.\n\n"
+                f"Your request: {description}"
+            )
+
+        schema_block = "\n\n".join(schema_context)
+        lines = [
+            "## NL-to-SQL: Schema Context\n",
+            f"**Request:** {description}\n",
+            "### Available schema (use these exact column names)\n",
+            "```",
+            schema_block,
+            "```\n",
+            "### Key schema notes",
+        ]
+
+        # Surface partition and cluster hints
+        for tref in tables_to_fetch[:5]:
+            try:
+                table = await _run(lambda: client.get_table(tref))
+                if table.time_partitioning:
+                    col = table.time_partitioning.field or "_PARTITIONTIME"
+                    lines.append(
+                        f"- `{tref.split('.')[-1]}` is partitioned by `{col}` — "
+                        "always filter on this column to avoid full table scans."
+                    )
+                if table.clustering_fields:
+                    lines.append(
+                        f"- `{tref.split('.')[-1]}` is clustered by "
+                        f"{', '.join(f'`{c}`' for c in table.clustering_fields)} — "
+                        "filter or order by these columns for best performance."
+                    )
+            except Exception:
+                pass
+
+        lines += [
+            "",
+            "_Use the schema above to write accurate BigQuery SQL for the request. "
+            "Reference exact column names, filter on partition columns, "
+            "and avoid SELECT * — specify only the columns needed._",
+        ]
+        return _text("\n".join(lines))
+    except Exception as e:
+        return _text(f"nl_to_sql schema fetch failed: {e}")
