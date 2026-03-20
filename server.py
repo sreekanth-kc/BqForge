@@ -13,6 +13,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp import types
 import gcp_tools
+import sql_parser
 
 # ─────────────────────────────────────────────
 # Knowledge base
@@ -595,39 +596,6 @@ async def list_tools() -> list[types.Tool]:
                 "required": ["job_id"],
             },
         ),
-        # ── Static intelligence tools (no GCP required)
-        types.Tool(
-            name="generate_cte_refactor",
-            description=(
-                "Analyse a SQL query and suggest a CTE (WITH clause) based refactor "
-                "when deeply nested subqueries are detected."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "sql": {"type": "string", "description": "The SQL query to refactor."},
-                },
-                "required": ["sql"],
-            },
-        ),
-        types.Tool(
-            name="suggest_materialized_view",
-            description=(
-                "Analyse a SQL query and recommend whether a Materialized View would help, "
-                "then generate the CREATE MATERIALIZED VIEW statement."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "sql": {"type": "string", "description": "The SQL query to analyse."},
-                    "dataset_id": {
-                        "type": "string",
-                        "description": "Target dataset for the MV (optional, used in generated DDL).",
-                    },
-                },
-                "required": ["sql"],
-            },
-        ),
         types.Tool(
             name="detect_zombie_queries",
             description=(
@@ -685,25 +653,20 @@ async def list_tools() -> list[types.Tool]:
             },
         ),
         types.Tool(
-            name="nl_to_sql",
+            name="review_query_with_schema",
             description=(
-                "Fetch real schema for a dataset/tables and return structured schema context "
-                "grounded in actual column names, partition keys, and clustering fields — "
-                "enabling accurate BigQuery SQL generation from a natural language description."
+                "Schema-aware SQL review. Extracts tables from the query, fetches their actual "
+                "partition and clustering columns from BigQuery, and checks whether the WHERE clause "
+                "filters on the REAL partition column — not just any date expression. "
+                "Use alongside review_query for complete coverage."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "description": {"type": "string", "description": "Natural language description of the query you want, e.g. 'get total revenue per country for last 30 days'."},
-                    "dataset_id": {"type": "string", "description": "Dataset to pull schema from."},
-                    "table_ids": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Specific table names within the dataset (optional; if omitted, first 10 tables are fetched).",
-                    },
+                    "sql": {"type": "string", "description": "The BigQuery SQL to review."},
                     "project_id": {"type": "string", "description": "GCP project (defaults to authenticated project)."},
                 },
-                "required": ["description"],
+                "required": ["sql"],
             },
         ),
     ]
@@ -814,10 +777,6 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             job_id=arguments["job_id"],
             location=arguments.get("location", "US"),
         )
-    elif name == "generate_cte_refactor":
-        return _generate_cte_refactor(arguments["sql"])
-    elif name == "suggest_materialized_view":
-        return _suggest_materialized_view(arguments["sql"], arguments.get("dataset_id", "my_dataset"))
     elif name == "detect_zombie_queries":
         return await gcp_tools.detect_zombie_queries(
             days=arguments.get("days", 30),
@@ -838,11 +797,9 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             min_runs=arguments.get("min_runs", 3),
             region=arguments.get("region", "us"),
         )
-    elif name == "nl_to_sql":
-        return await gcp_tools.nl_to_sql(
-            description=arguments["description"],
-            dataset_id=arguments.get("dataset_id"),
-            table_ids=arguments.get("table_ids"),
+    elif name == "review_query_with_schema":
+        return await gcp_tools.review_query_with_schema(
+            sql=arguments["sql"],
             project_id=arguments.get("project_id"),
         )
 
@@ -1081,34 +1038,54 @@ def _list_all_practice_ids() -> list[types.TextContent]:
 # ─────────────────────────────────────────────
 # Tool: review_query
 # ─────────────────────────────────────────────
-def _has_partition_filter(sql_lower: str) -> bool:
-    """Return True if the SQL WHERE clause contains a credible date/time partition filter."""
-    if "where" not in sql_lower:
-        return False
-    where_idx = sql_lower.rfind("where")
-    where_clause = sql_lower[where_idx:]
-    signals = [
-        "_partitiontime", "_partitiondate",
-        "date(", "timestamp_trunc(", "datetime_trunc(",
-        " between ", "date_sub(", "date_add(",
-        "current_date", "current_timestamp",
-        "interval ",
-    ]
-    return any(sig in where_clause for sig in signals)
+def _has_partition_filter(where_clause: str) -> bool:
+    """
+    Return True if the WHERE clause contains a filter on a known partition pseudo-column
+    OR an explicit date/timestamp comparison that would prune DATE/TIMESTAMP partitions.
+    Uses comment-stripped, normalised SQL so inline comments can't fool the check.
+    """
+    # Tier 1: explicit BigQuery partition pseudo-columns — definitive
+    pseudo = ["_partitiontime", "_partitiondate"]
+    if any(p in where_clause for p in pseudo):
+        return True
+
+    # Tier 2: date/time function calls applied to a column (likely partition key)
+    # e.g. DATE(col) = ..., TIMESTAMP_TRUNC(col, DAY) >= ..., DATETIME_TRUNC(...)
+    if re.search(
+        r"\b(date|timestamp_trunc|datetime_trunc)\s*\(\s*\w",
+        where_clause,
+    ):
+        return True
+
+    # Tier 3: direct comparison with a date literal or CURRENT_DATE/TIMESTAMP
+    # e.g. col >= '2024-01-01', col BETWEEN ..., col >= CURRENT_DATE()
+    if re.search(
+        r"\w+\s*(>=|<=|=|between)\s*['\"](20\d{2}|19\d{2})",  # date literal
+        where_clause,
+    ):
+        return True
+    if re.search(
+        r"\w+\s*(>=|<=|=)\s*(current_date|current_timestamp)\b",
+        where_clause,
+    ):
+        return True
+
+    return False
 
 
-def _detect_join_order_issue(sql_lower: str) -> str | None:
+def _detect_join_order_issue(clean_sql: str) -> str | None:
     """Return a description string if a potential JOIN order issue is detected, else None."""
-    # Subquery (derived table) on the left of a JOIN — usually the smaller side should be on the right
-    if re.search(r"from\s*\(select", sql_lower):
-        if re.search(r"\)\s*(as\s+\w+\s+)?(inner\s+join|left\s+join|right\s+join|\bjoin\b)", sql_lower):
+    if re.search(r"from\s*\(select", clean_sql):
+        if re.search(
+            r"\)\s*(as\s+\w+\s+)?(inner\s+join|left\s+join|right\s+join|\bjoin\b)",
+            clean_sql,
+        ):
             return (
                 "Derived table (subquery) is on the LEFT of a JOIN. "
                 "In BigQuery hash joins the left side is broadcast; place the largest plain table first "
                 "and the smaller derived/filtered result on the right."
             )
-    # RIGHT JOIN — usually a sign tables are in the wrong order
-    if re.search(r"\bright\s+(outer\s+)?join\b", sql_lower):
+    if re.search(r"\bright\s+(outer\s+)?join\b", clean_sql):
         return (
             "RIGHT JOIN detected — rewriting as a LEFT JOIN by swapping table order is more readable "
             "and makes JOIN intent explicit."
@@ -1117,34 +1094,30 @@ def _detect_join_order_issue(sql_lower: str) -> str | None:
 
 
 def _review_query(sql: str) -> list[types.TextContent]:
-    sql_lower = sql.lower()
-    findings: list[dict] = []  # each: {pid, msg, fix}
+    # Work on comment-stripped, normalised SQL for all checks
+    clean = sql_parser.clean(sql)
+    s = clean.lower()
+    findings: list[dict] = []
 
     # 1. SELECT *
-    if "select *" in sql_lower:
+    if re.search(r"\bselect\s+\*", s):
         findings.append({
             "pid": "QO-001",
             "msg": "SELECT * detected — specify only the columns you need to reduce bytes scanned.",
-            "fix": re.sub(
-                r"(?i)select\s+\*",
-                "SELECT col1, col2, col3  -- list only the columns you need",
-                sql, count=1,
-            ),
+            "fix": re.sub(r"(?i)\bselect\s+\*", "SELECT col1, col2, col3  -- list only needed columns", sql, count=1),
         })
 
     # 2. CROSS JOIN
-    if "cross join" in sql_lower:
+    if re.search(r"\bcross\s+join\b", s):
         findings.append({
             "pid": "QO-003",
             "msg": "CROSS JOIN detected — produces a cartesian product; extremely expensive on large tables.",
-            "fix": (
-                re.sub(r"(?i)cross\s+join", "INNER JOIN", sql, count=1)
-                + "\n-- Add ON clause: ON table1.key = table2.key"
-            ),
+            "fix": re.sub(r"(?i)\bcross\s+join\b", "INNER JOIN", sql, count=1)
+                   + "\n-- Add ON clause: ON table1.key = table2.key",
         })
 
     # 3. ORDER BY without LIMIT
-    if "order by" in sql_lower and "limit" not in sql_lower:
+    if re.search(r"\border\s+by\b", s) and not re.search(r"\blimit\b", s):
         findings.append({
             "pid": "QO-004",
             "msg": "ORDER BY without LIMIT — sorting the full result set wastes resources.",
@@ -1152,36 +1125,36 @@ def _review_query(sql: str) -> list[types.TextContent]:
         })
 
     # 4. Cache-busting non-deterministic functions
-    if any(f in sql_lower for f in ["now()", "current_timestamp()", "current_date()"]):
+    if re.search(r"\b(now|current_timestamp|current_date)\s*\(\s*\)", s):
         findings.append({
             "pid": "CO-002",
             "msg": "Non-deterministic function (NOW / CURRENT_TIMESTAMP) — prevents result-cache hits.",
             "fix": (
-                "-- Use a query parameter instead so the same value is reused across runs:\n"
+                "-- Use a query parameter so the same value is reused across runs:\n"
                 "-- Replace:  WHERE ts >= CURRENT_TIMESTAMP() - INTERVAL 7 DAY\n"
                 "-- With:     WHERE DATE(ts) = @run_date  -- pass @run_date as a query parameter"
             ),
         })
 
-    # 5. Partition pruning (deep check)
-    if "from" in sql_lower:
-        if "where" not in sql_lower:
+    # 5. Partition pruning — uses comment-stripped WHERE clause
+    if re.search(r"\bfrom\b", s):
+        where_clause = sql_parser.get_where_clause(clean)
+        if not where_clause:
             findings.append({
                 "pid": "QO-002",
                 "msg": "No WHERE clause — full table scan will occur on every partition.",
                 "fix": (
                     sql.rstrip().rstrip(";")
-                    + "\nWHERE _PARTITIONDATE = CURRENT_DATE()"
-                    + "  -- adjust to your actual partition column"
+                    + "\nWHERE _PARTITIONDATE = CURRENT_DATE()  -- adjust to your partition column"
                 ),
             })
-        elif not _has_partition_filter(sql_lower):
+        elif not _has_partition_filter(where_clause):
             findings.append({
                 "pid": "QO-002",
                 "msg": (
-                    "WHERE clause present but no date/time partition filter detected — "
-                    "partition pruning may not be active. If the target table is partitioned, "
-                    "add a filter on the partition column."
+                    "WHERE clause present but no recognisable partition filter detected. "
+                    "If the target table is partitioned, add a filter on the partition column "
+                    "to avoid a full scan. Use review_query_with_schema for a schema-aware check."
                 ),
                 "fix": (
                     "-- Add one of the following to your WHERE clause:\n"
@@ -1192,12 +1165,12 @@ def _review_query(sql: str) -> list[types.TextContent]:
             })
 
     # 6. NOT IN (subquery)
-    if "not in (select" in sql_lower:
+    if re.search(r"\bnot\s+in\s*\(\s*select\b", s):
         findings.append({
             "pid": "QO-005",
             "msg": "NOT IN (subquery) — prefer NOT EXISTS or LEFT JOIN / IS NULL.",
             "fix": (
-                "-- Option A — NOT EXISTS (often faster, handles NULLs correctly):\n"
+                "-- Option A — NOT EXISTS (faster, handles NULLs correctly):\n"
                 "-- WHERE NOT EXISTS (\n"
                 "--   SELECT 1 FROM other_table\n"
                 "--   WHERE other_table.id = main_table.id\n"
@@ -1208,14 +1181,14 @@ def _review_query(sql: str) -> list[types.TextContent]:
             ),
         })
 
-    # 7. Deeply nested subqueries
-    if sql_lower.count("select") > 2:
+    # 7. Deeply nested subqueries (count SELECT in clean SQL, not raw)
+    if sql_parser.count_keyword(sql, "select") > 2:
         findings.append({
             "pid": "QO-004",
             "msg": "Multiple nested subqueries — CTEs (WITH clauses) improve readability and optimizer visibility.",
             "fix": (
                 "WITH step1 AS (\n"
-                "  -- first subquery\n"
+                "  -- innermost subquery here\n"
                 "),\n"
                 "step2 AS (\n"
                 "  SELECT * FROM step1 WHERE ...\n"
@@ -1225,27 +1198,27 @@ def _review_query(sql: str) -> list[types.TextContent]:
         })
 
     # 8. HAVING without GROUP BY
-    if "having" in sql_lower and "group by" not in sql_lower:
+    if re.search(r"\bhaving\b", s) and not re.search(r"\bgroup\s+by\b", s):
         findings.append({
             "pid": "QO-004",
             "msg": "HAVING without GROUP BY — likely a logic error. Use WHERE to filter individual rows.",
             "fix": re.sub(r"(?i)\bhaving\b", "WHERE", sql, count=1),
         })
 
-    # 9. COUNT(DISTINCT) — suggest approximate variant
-    if "count(distinct" in sql_lower:
+    # 9. COUNT(DISTINCT ...) — handles arbitrary whitespace between tokens
+    if re.search(r"\bcount\s*\(\s*distinct\b", s):
         findings.append({
             "pid": "QO-006",
             "msg": "COUNT(DISTINCT) — use APPROX_COUNT_DISTINCT() for large datasets (~1% error, dramatically faster).",
             "fix": re.sub(
-                r"(?i)COUNT\s*\(\s*DISTINCT\s+(\w+)\s*\)",
+                r"(?i)\bCOUNT\s*\(\s*DISTINCT\s+(\w+)\s*\)",
                 r"APPROX_COUNT_DISTINCT(\1)",
                 sql,
             ),
         })
 
-    # 10. JOIN order analysis
-    join_issue = _detect_join_order_issue(sql_lower)
+    # 10. JOIN order
+    join_issue = _detect_join_order_issue(s)
     if join_issue:
         findings.append({
             "pid": "QO-003",
@@ -1263,8 +1236,8 @@ def _review_query(sql: str) -> list[types.TextContent]:
             type="text",
             text=(
                 "No obvious best-practice violations detected.\n\n"
-                "Always verify: partition pruning is active, clustering columns are filtered, "
-                "and data types match column definitions."
+                "Run review_query_with_schema (requires GCP) for a schema-aware check "
+                "that verifies the actual partition column is being filtered."
             ),
         )]
 
@@ -1274,149 +1247,10 @@ def _review_query(sql: str) -> list[types.TextContent]:
         parts.append(f"**Suggested fix:**\n```sql\n{f['fix']}\n```\n")
     parts.append(
         "---\nUse `get_practice_detail` with any ID above for full guidance, "
-        "or `get_practices` with a relevant topic for broader context."
+        "or `get_practices` with a relevant topic for broader context.\n"
+        "For schema-aware partition checks, use `review_query_with_schema`."
     )
     return [types.TextContent(type="text", text="\n".join(parts))]
-
-
-# ─────────────────────────────────────────────
-# Tool: generate_cte_refactor  (static, no GCP)
-# ─────────────────────────────────────────────
-def _generate_cte_refactor(sql: str) -> list[types.TextContent]:
-    sql_lower = sql.lower()
-    select_count = sql_lower.count("select")
-
-    if select_count <= 1:
-        return [types.TextContent(
-            type="text",
-            text="No nested subqueries detected — this query does not need a CTE refactor.",
-        )]
-
-    if select_count == 2:
-        depth = "one level of nesting"
-        benefit = "moderate"
-    else:
-        depth = f"{select_count - 1} levels of nesting"
-        benefit = "high"
-
-    # Extract fragments heuristically: split on "from (" boundaries
-    fragments = re.split(r"(?i)\bfrom\s*\(", sql)
-
-    lines = [
-        f"## CTE Refactor Suggestion\n",
-        f"Detected {depth} — CTE refactor benefit: **{benefit}**.\n",
-        "### Pattern detected",
-        "```sql",
-        sql[:600] + ("..." if len(sql) > 600 else ""),
-        "```\n",
-        "### Suggested CTE structure",
-        "```sql",
-        "-- Step 1: Name your innermost subquery as a CTE",
-        "WITH",
-        "  base_data AS (",
-        "    -- Move your innermost FROM (...) subquery here",
-        "    SELECT ...",
-        "    FROM your_source_table",
-        "    WHERE ...  -- keep filters close to the source",
-        "  ),",
-        "",
-        "  transformed AS (",
-        "    -- Apply transformations / joins on base_data",
-        "    SELECT ...",
-        "    FROM base_data",
-        "    WHERE ...",
-        "  ),",
-        "",
-        "  aggregated AS (",
-        "    -- Final aggregation or window functions",
-        "    SELECT ...",
-        "    FROM transformed",
-        "    GROUP BY ...",
-        "  )",
-        "",
-        "-- Final SELECT",
-        "SELECT *",
-        "FROM aggregated;",
-        "```\n",
-        "### Why CTEs are better here",
-        "- BigQuery's query planner can optimise each CTE stage independently.",
-        "- Deeply nested subqueries are harder to debug and profile.",
-        "- CTEs make it easier to inspect intermediate results during development.",
-        "- Each CTE is executed once; repeated references don't re-scan.",
-    ]
-    return [types.TextContent(type="text", text="\n".join(lines))]
-
-
-# ─────────────────────────────────────────────
-# Tool: suggest_materialized_view  (static, no GCP)
-# ─────────────────────────────────────────────
-def _suggest_materialized_view(sql: str, dataset_id: str = "my_dataset") -> list[types.TextContent]:
-    sql_lower = sql.lower()
-
-    signals: list[str] = []
-    score = 0
-
-    if "group by" in sql_lower:
-        signals.append("GROUP BY aggregation detected — MVs pre-compute aggregates.")
-        score += 3
-    if re.search(r"\b(sum|avg|count|min|max)\s*\(", sql_lower):
-        signals.append("Aggregate functions detected — ideal for MV pre-computation.")
-        score += 2
-    if "join" in sql_lower:
-        signals.append("JOIN detected — MVs can pre-materialise join results.")
-        score += 2
-    if "where" in sql_lower:
-        signals.append("WHERE filter detected — MV can store the pre-filtered subset.")
-        score += 1
-    if sql_lower.count("select") > 1:
-        signals.append("Nested subqueries detected — MV simplifies the outer query.")
-        score += 1
-
-    if score < 3:
-        return [types.TextContent(
-            type="text",
-            text=(
-                "A Materialized View is unlikely to help significantly for this query.\n\n"
-                "MVs work best for queries with GROUP BY aggregations or expensive JOINs "
-                "that run frequently on the same dataset."
-            ),
-        )]
-
-    recommendation = "highly recommended" if score >= 6 else "recommended" if score >= 4 else "worth considering"
-
-    # Generate a CREATE MV statement (simplified)
-    # Strip trailing semicolon, wrap in CREATE MATERIALIZED VIEW DDL
-    clean_sql = sql.strip().rstrip(";")
-
-    lines = [
-        f"## Materialized View Suggestion\n",
-        f"Recommendation: **{recommendation}** (score: {score}/8)\n",
-        "**Signals:**",
-    ]
-    for s in signals:
-        lines.append(f"  - {s}")
-
-    lines += [
-        "",
-        "### Generated DDL",
-        "```sql",
-        f"CREATE MATERIALIZED VIEW `{dataset_id}.mv_your_view_name`",
-        "OPTIONS (",
-        "  enable_refresh = TRUE,",
-        "  refresh_interval_minutes = 60  -- adjust to your freshness requirements",
-        ")",
-        "AS (",
-        *[f"  {line}" for line in clean_sql.splitlines()],
-        ");",
-        "```\n",
-        "### Important considerations",
-        "- MVs in BigQuery support a [subset of SQL](https://cloud.google.com/bigquery/docs/materialized-views-create#supported-mvs).",
-        "- Queries on source tables will automatically use the MV if the query matches (smart tuning).",
-        "- Set `refresh_interval_minutes` based on your acceptable data staleness.",
-        "- MVs are billed for storage + refresh compute — run `dry_run_query` on the MV SQL first.",
-        "- Use `list_materialized_views` after creation to monitor refresh status.",
-    ]
-    return [types.TextContent(type="text", text="\n".join(lines))]
 
 
 # ─────────────────────────────────────────────

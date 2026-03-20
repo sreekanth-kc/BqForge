@@ -8,12 +8,14 @@ Blocking BigQuery SDK calls are dispatched to a thread pool via asyncio.to_threa
 import asyncio
 import hashlib
 import json
+import os
 import re
 from datetime import datetime, timezone
 
 from mcp import types
 
-_ON_DEMAND_PRICE_PER_TB = 6.25  # USD, BigQuery on-demand pricing
+# Configurable via env var — set BQ_PRICE_PER_TB to override (e.g. for regional pricing)
+_ON_DEMAND_PRICE_PER_TB = float(os.environ.get("BQ_PRICE_PER_TB", "6.25"))
 
 _GCP_NOT_CONFIGURED = (
     "GCP credentials are not configured.\n\n"
@@ -37,6 +39,20 @@ def _client():
 async def _run(fn, *args, **kwargs):
     """Run a blocking callable in a thread pool."""
     return await asyncio.to_thread(fn, *args, **kwargs)
+
+
+async def _retry_run(fn, retries: int = 3, delay: float = 2.0):
+    """Run a blocking callable with exponential-backoff retries (for INFORMATION_SCHEMA queries)."""
+    import time
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            return await asyncio.to_thread(fn)
+        except Exception as e:
+            last_exc = e
+            if attempt < retries - 1:
+                await asyncio.sleep(delay * (2 ** attempt))
+    raise last_exc
 
 
 # ─────────────────────────────────────────────
@@ -287,7 +303,7 @@ async def query_history(
         LIMIT {top_n}
         """
 
-        rows = await _run(lambda: list(client.query(sql).result()))
+        rows = await _retry_run(lambda: list(client.query(sql).result()))
 
         if not rows:
             return _text(f"No completed query jobs in the last {days} days.")
@@ -342,6 +358,7 @@ async def get_cost_attribution(
                 creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {days} DAY)
                 AND state = 'DONE'
                 AND job_type = 'QUERY'
+                AND ARRAY_LENGTH(labels) > 0
             GROUP BY label_key, label_value
             ORDER BY est_cost_usd DESC
             LIMIT 25
@@ -365,7 +382,7 @@ async def get_cost_attribution(
             """
             label_mode = False
 
-        rows = await _run(lambda: list(client.query(sql).result()))
+        rows = await _retry_run(lambda: list(client.query(sql).result()))
 
         if not rows:
             return _text(f"No billing data in the last {days} days.")
@@ -431,7 +448,7 @@ async def profile_table(
             f"FROM `{table_ref}` TABLESAMPLE SYSTEM ({pct} PERCENT)"
         )
 
-        rows = await _run(lambda: list(client.query(sql).result()))
+        rows = await _retry_run(lambda: list(client.query(sql).result()))
         if not rows:
             return _text("Table appears to be empty.")
 
@@ -601,7 +618,7 @@ async def get_expensive_queries(
         ORDER BY total_bytes_processed DESC
         LIMIT {top_n}
         """
-        rows = await _run(lambda: list(client.query(sql).result()))
+        rows = await _retry_run(lambda: list(client.query(sql).result()))
         if not rows:
             return _text(f"No completed queries found in the last {days} days.")
 
@@ -644,7 +661,7 @@ async def get_slot_utilization(
         GROUP BY reservation_id
         ORDER BY slot_hours DESC
         """
-        rows = await _run(lambda: list(client.query(sql).result()))
+        rows = await _retry_run(lambda: list(client.query(sql).result()))
         if not rows:
             return _text(f"No slot data found in the last {days} days.")
 
@@ -1111,7 +1128,7 @@ async def detect_zombie_queries(
         LIMIT 25
         """
 
-        rows = await _run(lambda: list(client.query(sql).result()))
+        rows = await _retry_run(lambda: list(client.query(sql).result()))
 
         if not rows:
             return _text(
@@ -1200,7 +1217,7 @@ async def map_table_lineage(
         LIMIT 200
         """
 
-        rows = await _run(lambda: list(client.query(sql).result()))
+        rows = await _retry_run(lambda: list(client.query(sql).result()))
 
         if not rows:
             return _text(
@@ -1346,7 +1363,7 @@ async def detect_performance_regression(
         LIMIT 20
         """
 
-        rows = await _run(lambda: list(client.query(sql).result()))
+        rows = await _retry_run(lambda: list(client.query(sql).result()))
 
         if not rows:
             return _text(
@@ -1396,106 +1413,141 @@ async def detect_performance_regression(
 
 
 # ─────────────────────────────────────────────
-# nl_to_sql
+# review_query_with_schema
 # ─────────────────────────────────────────────
-async def nl_to_sql(
-    description: str,
-    dataset_id: str | None = None,
-    table_ids: list[str] | None = None,
+async def review_query_with_schema(
+    sql: str,
     project_id: str | None = None,
 ) -> list[types.TextContent]:
     """
-    Fetch real schema for the referenced tables and return structured context
-    so the AI can generate accurate, grounded BigQuery SQL.
+    Schema-aware SQL review. Extracts table references from the SQL,
+    fetches their actual partition and clustering columns from BigQuery,
+    then checks whether the WHERE clause actually filters on the real
+    partition column — not just any date-like expression.
     """
+    from sql_parser import extract_table_refs, get_where_clause, clean
+
     try:
         client = _client()
         project = project_id or client.project
 
-        schema_context: list[str] = []
-
-        if dataset_id:
-            # If specific tables provided, use them; otherwise list the dataset
-            if table_ids:
-                tables_to_fetch = [
-                    f"{project}.{dataset_id}.{t}" for t in table_ids
-                ]
-            else:
-                all_tables = await _run(
-                    lambda: list(client.list_tables(f"{project}.{dataset_id}"))
-                )
-                tables_to_fetch = [
-                    f"{project}.{dataset_id}.{t.table_id}"
-                    for t in all_tables[:10]  # cap at 10 tables
-                ]
-
-            for tref in tables_to_fetch:
-                try:
-                    table = await _run(lambda: client.get_table(tref))
-                    cols = []
-                    for f in table.schema:
-                        desc = f" -- {f.description}" if f.description else ""
-                        cols.append(f"    {f.name} {f.field_type} ({f.mode}){desc}")
-
-                    part_info = ""
-                    if table.time_partitioning:
-                        col = table.time_partitioning.field or "_PARTITIONTIME"
-                        part_info = f"  -- Partitioned by: {col} ({table.time_partitioning.type_})"
-
-                    clust_info = ""
-                    if table.clustering_fields:
-                        clust_info = f"  -- Clustered by: {', '.join(table.clustering_fields)}"
-
-                    schema_context.append(
-                        f"TABLE `{tref}`{part_info}{clust_info}\n"
-                        + "\n".join(cols)
-                    )
-                except Exception:
-                    schema_context.append(f"TABLE `{tref}` -- (schema unavailable)")
-
-        if not schema_context:
+        table_refs = extract_table_refs(sql)
+        if not table_refs:
             return _text(
-                "No schema context available. Provide dataset_id (and optionally table_ids) "
-                "so BqForge can ground the SQL in real column names.\n\n"
-                f"Your request: {description}"
+                "Could not extract table references from the SQL. "
+                "Make sure the query contains a FROM clause with a table name."
             )
 
-        schema_block = "\n\n".join(schema_context)
-        lines = [
-            "## NL-to-SQL: Schema Context\n",
-            f"**Request:** {description}\n",
-            "### Available schema (use these exact column names)\n",
-            "```",
-            schema_block,
-            "```\n",
-            "### Key schema notes",
-        ]
-
-        # Surface partition and cluster hints
-        for tref in tables_to_fetch[:5]:
+        schema_info: dict[str, dict] = {}
+        for ref in table_refs:
+            parts = ref.split(".")
+            if len(parts) == 3:
+                full_ref = ref
+            elif len(parts) == 2:
+                full_ref = f"{project}.{ref}"
+            else:
+                # Single-part — likely an alias or CTE name, skip
+                continue
             try:
-                table = await _run(lambda: client.get_table(tref))
+                table = await _run(lambda: client.get_table(full_ref))
+                partition_col = None
                 if table.time_partitioning:
-                    col = table.time_partitioning.field or "_PARTITIONTIME"
-                    lines.append(
-                        f"- `{tref.split('.')[-1]}` is partitioned by `{col}` — "
-                        "always filter on this column to avoid full table scans."
-                    )
-                if table.clustering_fields:
-                    lines.append(
-                        f"- `{tref.split('.')[-1]}` is clustered by "
-                        f"{', '.join(f'`{c}`' for c in table.clustering_fields)} — "
-                        "filter or order by these columns for best performance."
-                    )
+                    partition_col = table.time_partitioning.field or "_PARTITIONTIME"
+                schema_info[ref] = {
+                    "full_ref": full_ref,
+                    "partition_col": partition_col,
+                    "clustering": table.clustering_fields or [],
+                    "size_gb": (table.num_bytes or 0) / 1e9,
+                    "require_partition_filter": getattr(
+                        table, "require_partition_filter", False
+                    ),
+                }
             except Exception:
-                pass
+                pass  # table not accessible — skip silently
+
+        if not schema_info:
+            return _text(
+                f"Could not fetch schema for any of the detected tables: {table_refs}. "
+                "Ensure the authenticated service account has BigQuery Data Viewer access."
+            )
+
+        where_clause = get_where_clause(sql)
+        findings: list[str] = []
+        good: list[str] = []
+
+        for ref, info in schema_info.items():
+            pcol = info["partition_col"]
+            clustering = info["clustering"]
+            size_gb = info["size_gb"]
+            full_ref = info["full_ref"]
+
+            if pcol:
+                pcol_lower = pcol.lower()
+                # Check if actual partition column appears in WHERE
+                # Handles: direct reference, DATE(col), TIMESTAMP_TRUNC(col, ...), col >= ...
+                partition_patterns = [
+                    pcol_lower,
+                    f"date({pcol_lower})",
+                    f"timestamp_trunc({pcol_lower}",
+                    f"datetime_trunc({pcol_lower}",
+                ]
+                partition_filtered = any(p in where_clause for p in partition_patterns)
+                # Also accept _PARTITIONTIME / _PARTITIONDATE pseudo-columns
+                pseudo_filtered = "_partitiontime" in where_clause or "_partitiondate" in where_clause
+
+                if partition_filtered or pseudo_filtered:
+                    good.append(
+                        f"  `{ref}` — partition filter on `{pcol}` detected. Partition pruning active."
+                    )
+                else:
+                    est_full_scan = size_gb / 1e3 * _ON_DEMAND_PRICE_PER_TB  # cost if full scan
+                    findings.append(
+                        f"  `{ref}` — partitioned by `{pcol}` but no filter on this column found in WHERE. "
+                        f"Full scan cost: ~${est_full_scan:.4f} USD ({size_gb:.1f} GB). "
+                        f"Fix: add `AND {pcol} >= TIMESTAMP('2024-01-01')` "
+                        f"(or `AND DATE({pcol}) = CURRENT_DATE()`) to your WHERE clause."
+                    )
+            else:
+                if size_gb > 1:
+                    findings.append(
+                        f"  `{ref}` — {size_gb:.1f} GB table has no partitioning. "
+                        "Consider adding DATE/TIMESTAMP partitioning to reduce scan cost (PT-001)."
+                    )
+
+            if clustering and where_clause:
+                missing_cluster = [
+                    c for c in clustering if c.lower() not in where_clause
+                ]
+                if missing_cluster:
+                    findings.append(
+                        f"  `{ref}` — clustered by [{', '.join(clustering)}] but "
+                        f"[{', '.join(missing_cluster)}] not in WHERE. "
+                        "Filtering on cluster columns improves pruning within partitions."
+                    )
+                else:
+                    good.append(
+                        f"  `{ref}` — all cluster columns [{', '.join(clustering)}] are filtered."
+                    )
+
+        lines = ["# Schema-Aware Query Review\n"]
+        lines.append(f"Tables analysed: {', '.join(f'`{r}`' for r in schema_info)}\n")
+
+        if findings:
+            lines.append(f"## Issues ({len(findings)})\n")
+            lines.extend(findings)
+        if good:
+            lines.append("\n## Confirmed Good\n")
+            lines.extend(good)
+
+        if not findings:
+            lines.append(
+                "No schema-level issues found. Partition and cluster filters look correct."
+            )
 
         lines += [
             "",
-            "_Use the schema above to write accurate BigQuery SQL for the request. "
-            "Reference exact column names, filter on partition columns, "
-            "and avoid SELECT * — specify only the columns needed._",
+            "_Tip: also run `review_query` for static SQL pattern checks (SELECT *, CROSS JOIN, etc.)._",
         ]
         return _text("\n".join(lines))
     except Exception as e:
-        return _text(f"nl_to_sql schema fetch failed: {e}")
+        return _text(f"review_query_with_schema failed: {e}")
