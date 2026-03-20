@@ -1,8 +1,8 @@
 <div align="center">
 
-![BqForge Preview](assets/preview.png)
+![QostEx Preview](assets/preview.png)
 
-# BqForge
+# QostEx
 
 ### BigQuery Best Practices MCP Server
 
@@ -21,7 +21,7 @@ A Model Context Protocol (MCP) server that brings curated BigQuery best practice
 
 ## What It Does
 
-BqForge gives Claude two things:
+QostEx gives Claude two things:
 
 - **81 curated best practices** across 13 categories — partition design, cost control, schema, security, and more
 - **32 live GCP tools** — query review, dry-run cost estimation, table profiling, job management, schema drift detection, and more
@@ -56,7 +56,7 @@ Just configure a system prompt once. Claude automatically pulls the right practi
 
 ```bash
 git clone https://github.com/sreekanth-kc/BqForge.git
-cd BqForge
+cd QostEx
 
 python3 -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
@@ -73,9 +73,9 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 ```json
 {
   "mcpServers": {
-    "bqforge": {
+    "qostex": {
       "command": "/absolute/path/to/.venv/bin/python",
-      "args": ["/absolute/path/to/BqForge/server.py"]
+      "args": ["/absolute/path/to/QostEx/server.py"]
     }
   }
 }
@@ -86,9 +86,9 @@ To enable live GCP tools, add your credentials:
 ```json
 {
   "mcpServers": {
-    "bqforge": {
+    "qostex": {
       "command": "/absolute/path/to/.venv/bin/python",
-      "args": ["/absolute/path/to/BqForge/server.py"],
+      "args": ["/absolute/path/to/QostEx/server.py"],
       "env": {
         "GCP_SERVICE_ACCOUNT_JSON": "/path/to/service-account.json",
         "GOOGLE_CLOUD_PROJECT": "your-project-id"
@@ -104,7 +104,7 @@ Restart Claude Desktop after saving.
 
 ## GCP Authentication
 
-BqForge tries credentials in this order:
+QostEx tries credentials in this order:
 
 1. `GCP_SERVICE_ACCOUNT_JSON` — path to a service account JSON file
 2. `GOOGLE_APPLICATION_CREDENTIALS` — standard GCP env var
@@ -125,7 +125,7 @@ Resource URI: bigquery://prompt
 Or simply tell Claude:
 
 ```
-use bqforge best practices
+use qostex best practices
 ```
 
 Claude will automatically call `resolve_topic` → `get_practices` whenever BigQuery topics arise.
@@ -244,7 +244,7 @@ Has this table's schema changed since last week?
 ## Project Structure
 
 ```
-BqForge/
+QostEx/
 ├── server.py                      # MCP server — tool registry and dispatch
 ├── gcp_tools.py                   # Live GCP tool implementations
 ├── gcp_client.py                  # BigQuery client with auth fallback chain

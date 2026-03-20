@@ -1,5 +1,5 @@
 """
-GCP authentication for BqForge.
+GCP authentication for QostEx.
 
 Priority order:
   1. GCP_SERVICE_ACCOUNT_JSON  — inline service-account JSON string (best for MCP config)

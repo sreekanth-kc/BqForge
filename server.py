@@ -1,5 +1,5 @@
 """
-BigQuery Best Practices MCP Server (BqForge)
+BigQuery Best Practices MCP Server (QostEx)
 Exposes BigQuery best practices as Tools and Resources.
 
 Two-step workflow:
@@ -66,7 +66,7 @@ _STOP_WORDS = {
 # ─────────────────────────────────────────────
 # Server setup
 # ─────────────────────────────────────────────
-server = Server("bqforge")
+server = Server("qostex")
 
 
 # ═══════════════════════════════════════════════
@@ -88,16 +88,16 @@ async def list_resources() -> list[types.Resource]:
         types.Resource(
             uri="bigquery://overview",
             name="BigQuery Best Practices Overview",
-            description="High-level overview of all BqForge best-practice categories.",
+            description="High-level overview of all QostEx best-practice categories.",
             mimeType="text/plain",
         )
     )
     resources.append(
         types.Resource(
             uri="bigquery://prompt",
-            name="BqForge – System Prompt Snippet",
+            name="QostEx – System Prompt Snippet",
             description=(
-                "Paste this into your system prompt to activate automatic BqForge "
+                "Paste this into your system prompt to activate automatic QostEx "
                 "lookups whenever BigQuery topics arise."
             ),
             mimeType="text/plain",
@@ -111,7 +111,7 @@ async def read_resource(uri: types.AnyUrl) -> str:
     uri_str = str(uri)
 
     if uri_str == "bigquery://overview":
-        lines = ["# BqForge – BigQuery Best Practices Overview\n"]
+        lines = ["# QostEx – BigQuery Best Practices Overview\n"]
         total = sum(len(d["practices"]) for d in ALL_PRACTICES.values())
         lines.append(f"**{total} practices across {len(ALL_PRACTICES)} categories.**\n")
         for key, data in ALL_PRACTICES.items():
@@ -543,7 +543,7 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="suggest_schema_improvements",
             description=(
-                "Analyse a table's schema against BqForge best practices and return "
+                "Analyse a table's schema against QostEx best practices and return "
                 "specific improvement suggestions (partitioning, clustering, data types, nesting)."
             ),
             inputSchema={
@@ -1026,7 +1026,7 @@ def _get_practice_detail(practice_id: str) -> list[types.TextContent]:
 # ─────────────────────────────────────────────
 def _list_all_practice_ids() -> list[types.TextContent]:
     total = sum(len(d["practices"]) for d in ALL_PRACTICES.values())
-    lines = [f"# All BqForge Practice IDs  ({total} total)\n"]
+    lines = [f"# All QostEx Practice IDs  ({total} total)\n"]
     for category, data in ALL_PRACTICES.items():
         lines.append(f"## {data['title']}")
         for p in data["practices"]:
@@ -1254,16 +1254,16 @@ def _review_query(sql: str) -> list[types.TextContent]:
 
 
 # ─────────────────────────────────────────────
-# "use bqforge" system prompt snippet
+# "use qostex" system prompt snippet
 # ─────────────────────────────────────────────
 _SYSTEM_PROMPT_SNIPPET = """\
-# BqForge – BigQuery Best Practices (use bqforge)
+# QostEx – BigQuery Best Practices (use qostex)
 
-You have access to the BqForge MCP server which provides curated, structured
+You have access to the QostEx MCP server which provides curated, structured
 BigQuery best practices across 6 categories (query optimisation, schema design,
 cost management, security, materialized views, monitoring).
 
-## When to use BqForge
+## When to use QostEx
 
 | User request                                    | Tool to call                         |
 |-------------------------------------------------|--------------------------------------|

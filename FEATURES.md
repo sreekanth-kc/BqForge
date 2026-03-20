@@ -1,4 +1,4 @@
-# BqForge — Full Feature Reference
+# QostEx — Full Feature Reference
 
 > **32 tools · 81 practices · 13 categories**
 > Last updated: 2026-03-20
@@ -24,7 +24,7 @@
 
 ## Overview
 
-BqForge is a Model Context Protocol (MCP) server that gives AI assistants (Claude, etc.) deep BigQuery intelligence — from curated best-practice knowledge to live GCP query execution, cost analysis, and schema exploration.
+QostEx is a Model Context Protocol (MCP) server that gives AI assistants (Claude, etc.) deep BigQuery intelligence — from curated best-practice knowledge to live GCP query execution, cost analysis, and schema exploration.
 
 | Dimension | Count |
 |---|---:|
@@ -361,7 +361,7 @@ Compare an expected schema (JSON array) against the actual BigQuery table schema
 ---
 
 ### `suggest_schema_improvements`
-Cross-reference a table's real schema against BqForge best practices and return actionable suggestions.
+Cross-reference a table's real schema against QostEx best practices and return actionable suggestions.
 
 | Parameter | Type | Description |
 |---|---|---|
@@ -477,7 +477,7 @@ MCP Resources are browsable, static assets that clients can read.
 |---|---|
 | `bigquery://overview` | High-level summary of all 13 categories and practice counts |
 | `bigquery://<category>` | Full JSON for any practice category (e.g. `bigquery://query_optimization`) |
-| `bigquery://prompt` | Ready-made system prompt snippet — paste into Claude project instructions to auto-activate BqForge |
+| `bigquery://prompt` | Ready-made system prompt snippet — paste into Claude project instructions to auto-activate QostEx |
 
 ---
 
@@ -505,7 +505,7 @@ MCP Resources are browsable, static assets that clients can read.
 
 ## GCP Authentication
 
-BqForge tries credentials in this order:
+QostEx tries credentials in this order:
 
 | Priority | Method | How to set |
 |---|---|---|
@@ -518,7 +518,7 @@ BqForge tries credentials in this order:
 ```json
 {
   "mcpServers": {
-    "bqforge": {
+    "qostex": {
       "command": "python3",
       "args": ["server.py"],
       "env": {
