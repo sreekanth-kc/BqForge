@@ -1529,6 +1529,27 @@ async def review_query_with_schema(
                         f"  `{ref}` — all cluster columns [{', '.join(clustering)}] are filtered."
                     )
 
+        # JOIN order check — fires automatically when 2+ tables have size data
+        sized_tables = [
+            (ref, schema_info[ref]["size_gb"])
+            for ref in table_refs
+            if ref in schema_info
+        ]
+        if len(sized_tables) >= 2:
+            from_table, from_size = sized_tables[0]
+            largest_ref, largest_size = max(sized_tables, key=lambda x: x[1])
+            if largest_ref != from_table and largest_size > from_size * 1.25:
+                reordered = sorted(sized_tables, key=lambda x: x[1], reverse=True)
+                size_summary = ", ".join(
+                    f"`{r}` ({s:.1f} GB)" for r, s in reordered
+                )
+                findings.append(
+                    f"  **JOIN order** (QO-007) — `{from_table}` ({from_size:.1f} GB) is the driving "
+                    f"table but `{largest_ref}` ({largest_size:.1f} GB) is larger. "
+                    f"BigQuery broadcasts the smaller side; put the largest table in FROM. "
+                    f"Recommended order: {size_summary}."
+                )
+
         lines = ["# Schema-Aware Query Review\n"]
         lines.append(f"Tables analysed: {', '.join(f'`{r}`' for r in schema_info)}\n")
 
