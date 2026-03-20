@@ -12,6 +12,7 @@ import re
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp import types
+import gcp_tools
 
 # ─────────────────────────────────────────────
 # Knowledge base
@@ -249,11 +250,208 @@ async def list_tools() -> list[types.Tool]:
             description="Return a compact list of every practice ID + title across all categories.",
             inputSchema={"type": "object", "properties": {}},
         ),
+
+        # ── GCP-powered tools (require credentials)
+        types.Tool(
+            name="check_gcp_connection",
+            description=(
+                "Verify that GCP credentials are configured and working. "
+                "Run this first before using any other GCP tools."
+            ),
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        types.Tool(
+            name="dry_run_query",
+            description=(
+                "Dry-run a BigQuery SQL query to estimate bytes processed and cost "
+                "without actually executing it. No data is returned, no charges incurred."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "sql": {"type": "string", "description": "The BigQuery SQL query to dry-run."},
+                },
+                "required": ["sql"],
+            },
+        ),
+        types.Tool(
+            name="explore_schema",
+            description=(
+                "Browse GCP project structure. "
+                "No args → list datasets. "
+                "dataset_id → list tables. "
+                "dataset_id + table_id → show columns, partition, and cluster info."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "dataset_id": {"type": "string", "description": "Dataset to inspect (optional)."},
+                    "table_id": {"type": "string", "description": "Table to inspect (optional, requires dataset_id)."},
+                    "project_id": {"type": "string", "description": "GCP project ID (defaults to authenticated project)."},
+                },
+            },
+        ),
+        types.Tool(
+            name="get_table_info",
+            description=(
+                "Get metadata for a BigQuery table: row count, size, partitioning, "
+                "clustering, last modified time, and estimated full-scan cost."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "table_ref": {
+                        "type": "string",
+                        "description": "Table reference: project.dataset.table or dataset.table",
+                    },
+                },
+                "required": ["table_ref"],
+            },
+        ),
+        types.Tool(
+            name="execute_query",
+            description=(
+                "Execute a BigQuery SQL query and return results as a table. "
+                "Includes a safety cap on bytes billed (default 1 GB)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "sql": {"type": "string", "description": "The SQL query to execute."},
+                    "max_rows": {
+                        "type": "integer",
+                        "description": "Maximum rows to return (default 100).",
+                        "default": 100,
+                    },
+                    "max_bytes_billed": {
+                        "type": "integer",
+                        "description": "Safety cap on bytes billed in bytes (default 1 GB = 1000000000).",
+                        "default": 1000000000,
+                    },
+                },
+                "required": ["sql"],
+            },
+        ),
+        types.Tool(
+            name="query_history",
+            description=(
+                "Analyse recent BigQuery query history from INFORMATION_SCHEMA. "
+                "Returns top users by estimated cost, job counts, and avg/max durations."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "days": {
+                        "type": "integer",
+                        "description": "Lookback window in days (default 7).",
+                        "default": 7,
+                    },
+                    "top_n": {
+                        "type": "integer",
+                        "description": "Number of results to show (default 10).",
+                        "default": 10,
+                    },
+                    "region": {
+                        "type": "string",
+                        "description": "BigQuery region slug (default 'us').",
+                        "default": "us",
+                    },
+                },
+            },
+        ),
+        types.Tool(
+            name="get_cost_attribution",
+            description=(
+                "Break down BigQuery spend by user or label over a time window. "
+                "Useful for identifying who or what is driving costs."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "days": {
+                        "type": "integer",
+                        "description": "Lookback window in days (default 30).",
+                        "default": 30,
+                    },
+                    "group_by": {
+                        "type": "string",
+                        "enum": ["user", "label"],
+                        "description": "Group costs by 'user' or 'label' (default 'user').",
+                        "default": "user",
+                    },
+                    "region": {
+                        "type": "string",
+                        "description": "BigQuery region slug (default 'us').",
+                        "default": "us",
+                    },
+                },
+            },
+        ),
+        types.Tool(
+            name="profile_table",
+            description=(
+                "Generate column-level statistics for a BigQuery table: "
+                "non-null counts, distinct counts, min/max/avg for numeric columns, "
+                "min/max string lengths for string columns. Uses TABLESAMPLE for speed."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "table_ref": {
+                        "type": "string",
+                        "description": "Table reference: project.dataset.table or dataset.table",
+                    },
+                    "sample_percent": {
+                        "type": "integer",
+                        "description": "Percentage of rows to sample (default 5, range 1-100).",
+                        "default": 5,
+                    },
+                },
+                "required": ["table_ref"],
+            },
+        ),
+        types.Tool(
+            name="list_jobs",
+            description="List recent or currently running BigQuery jobs in the authenticated project.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "state": {
+                        "type": "string",
+                        "enum": ["RUNNING", "DONE", "PENDING"],
+                        "description": "Filter by job state (default 'RUNNING').",
+                        "default": "RUNNING",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum number of jobs to return (default 20).",
+                        "default": 20,
+                    },
+                },
+            },
+        ),
+        types.Tool(
+            name="cancel_job",
+            description="Cancel a running BigQuery job by its job ID.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "string", "description": "The BigQuery job ID to cancel."},
+                    "location": {
+                        "type": "string",
+                        "description": "Job location (default 'US').",
+                        "default": "US",
+                    },
+                },
+                "required": ["job_id"],
+            },
+        ),
     ]
 
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
+    # ── Best-practice tools (no GCP required)
     if name == "resolve_topic":
         return _resolve_topic(arguments["query"], arguments.get("top_k", 5))
     elif name == "get_practices":
@@ -272,6 +470,54 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         return _review_query(arguments["sql"])
     elif name == "list_all_practice_ids":
         return _list_all_practice_ids()
+
+    # ── GCP-powered tools (require credentials)
+    elif name == "check_gcp_connection":
+        return await gcp_tools.check_gcp_connection()
+    elif name == "dry_run_query":
+        return await gcp_tools.dry_run_query(arguments["sql"])
+    elif name == "explore_schema":
+        return await gcp_tools.explore_schema(
+            dataset_id=arguments.get("dataset_id"),
+            table_id=arguments.get("table_id"),
+            project_id=arguments.get("project_id"),
+        )
+    elif name == "get_table_info":
+        return await gcp_tools.get_table_info(arguments["table_ref"])
+    elif name == "execute_query":
+        return await gcp_tools.execute_query(
+            sql=arguments["sql"],
+            max_rows=arguments.get("max_rows", 100),
+            max_bytes_billed=arguments.get("max_bytes_billed", 1_000_000_000),
+        )
+    elif name == "query_history":
+        return await gcp_tools.query_history(
+            days=arguments.get("days", 7),
+            top_n=arguments.get("top_n", 10),
+            region=arguments.get("region", "us"),
+        )
+    elif name == "get_cost_attribution":
+        return await gcp_tools.get_cost_attribution(
+            days=arguments.get("days", 30),
+            group_by=arguments.get("group_by", "user"),
+            region=arguments.get("region", "us"),
+        )
+    elif name == "profile_table":
+        return await gcp_tools.profile_table(
+            table_ref=arguments["table_ref"],
+            sample_percent=arguments.get("sample_percent", 5),
+        )
+    elif name == "list_jobs":
+        return await gcp_tools.list_jobs(
+            state=arguments.get("state", "RUNNING"),
+            max_results=arguments.get("max_results", 20),
+        )
+    elif name == "cancel_job":
+        return await gcp_tools.cancel_job(
+            job_id=arguments["job_id"],
+            location=arguments.get("location", "US"),
+        )
+
     else:
         return [types.TextContent(type="text", text=f"Unknown tool: {name}")]
 
