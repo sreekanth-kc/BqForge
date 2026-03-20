@@ -753,58 +753,202 @@ def _list_all_practice_ids() -> list[types.TextContent]:
 # ─────────────────────────────────────────────
 # Tool: review_query
 # ─────────────────────────────────────────────
+def _has_partition_filter(sql_lower: str) -> bool:
+    """Return True if the SQL WHERE clause contains a credible date/time partition filter."""
+    if "where" not in sql_lower:
+        return False
+    where_idx = sql_lower.rfind("where")
+    where_clause = sql_lower[where_idx:]
+    signals = [
+        "_partitiontime", "_partitiondate",
+        "date(", "timestamp_trunc(", "datetime_trunc(",
+        " between ", "date_sub(", "date_add(",
+        "current_date", "current_timestamp",
+        "interval ",
+    ]
+    return any(sig in where_clause for sig in signals)
+
+
+def _detect_join_order_issue(sql_lower: str) -> str | None:
+    """Return a description string if a potential JOIN order issue is detected, else None."""
+    # Subquery (derived table) on the left of a JOIN — usually the smaller side should be on the right
+    if re.search(r"from\s*\(select", sql_lower):
+        if re.search(r"\)\s*(as\s+\w+\s+)?(inner\s+join|left\s+join|right\s+join|\bjoin\b)", sql_lower):
+            return (
+                "Derived table (subquery) is on the LEFT of a JOIN. "
+                "In BigQuery hash joins the left side is broadcast; place the largest plain table first "
+                "and the smaller derived/filtered result on the right."
+            )
+    # RIGHT JOIN — usually a sign tables are in the wrong order
+    if re.search(r"\bright\s+(outer\s+)?join\b", sql_lower):
+        return (
+            "RIGHT JOIN detected — rewriting as a LEFT JOIN by swapping table order is more readable "
+            "and makes JOIN intent explicit."
+        )
+    return None
+
+
 def _review_query(sql: str) -> list[types.TextContent]:
     sql_lower = sql.lower()
-    findings: list[str] = []
+    findings: list[dict] = []  # each: {pid, msg, fix}
 
-    checks = [
-        (lambda s: "select *" in s,
-         "QO-001",
-         "SELECT * detected – avoid selecting all columns; specify only what you need."),
-        (lambda s: "cross join" in s,
-         "QO-003",
-         "CROSS JOIN detected – produces a cartesian product; extremely expensive on large tables."),
-        (lambda s: "order by" in s and "limit" not in s,
-         "QO-004",
-         "ORDER BY without LIMIT – sorting the full result set wastes resources."),
-        (lambda s: any(f in s for f in ["now()", "current_timestamp()", "current_date()"]),
-         "CO-002",
-         "Non-deterministic function (NOW/CURRENT_TIMESTAMP) detected – prevents query-result caching."),
-        (lambda s: "where" not in s and "from" in s,
-         "QO-002",
-         "No WHERE / partition filter detected – consider filtering on a partition column to reduce scan cost."),
-        (lambda s: "not in (select" in s,
-         "QO-005",
-         "NOT IN (subquery) detected – prefer NOT EXISTS or LEFT JOIN / IS NULL for better performance."),
-        (lambda s: s.count("select") > 2,
-         "QO-004",
-         "Multiple nested subqueries detected – consider CTEs (WITH clauses) for readability and optimisation."),
-        (lambda s: "having" in s and "group by" not in s,
-         "QO-004",
-         "HAVING without GROUP BY – this may be a logic error; HAVING filters grouped results."),
-        (lambda s: "count(distinct" in s,
-         "QO-006",
-         "COUNT(DISTINCT) detected – consider APPROX_COUNT_DISTINCT() for large datasets where ~1% error is acceptable."),
-    ]
+    # 1. SELECT *
+    if "select *" in sql_lower:
+        findings.append({
+            "pid": "QO-001",
+            "msg": "SELECT * detected — specify only the columns you need to reduce bytes scanned.",
+            "fix": re.sub(
+                r"(?i)select\s+\*",
+                "SELECT col1, col2, col3  -- list only the columns you need",
+                sql, count=1,
+            ),
+        })
 
-    for pattern_fn, pid, msg in checks:
-        if pattern_fn(sql_lower):
-            findings.append(f"⚠️  [{pid}] {msg}")
+    # 2. CROSS JOIN
+    if "cross join" in sql_lower:
+        findings.append({
+            "pid": "QO-003",
+            "msg": "CROSS JOIN detected — produces a cartesian product; extremely expensive on large tables.",
+            "fix": (
+                re.sub(r"(?i)cross\s+join", "INNER JOIN", sql, count=1)
+                + "\n-- Add ON clause: ON table1.key = table2.key"
+            ),
+        })
 
+    # 3. ORDER BY without LIMIT
+    if "order by" in sql_lower and "limit" not in sql_lower:
+        findings.append({
+            "pid": "QO-004",
+            "msg": "ORDER BY without LIMIT — sorting the full result set wastes resources.",
+            "fix": sql.rstrip().rstrip(";") + "\nLIMIT 1000;",
+        })
+
+    # 4. Cache-busting non-deterministic functions
+    if any(f in sql_lower for f in ["now()", "current_timestamp()", "current_date()"]):
+        findings.append({
+            "pid": "CO-002",
+            "msg": "Non-deterministic function (NOW / CURRENT_TIMESTAMP) — prevents result-cache hits.",
+            "fix": (
+                "-- Use a query parameter instead so the same value is reused across runs:\n"
+                "-- Replace:  WHERE ts >= CURRENT_TIMESTAMP() - INTERVAL 7 DAY\n"
+                "-- With:     WHERE DATE(ts) = @run_date  -- pass @run_date as a query parameter"
+            ),
+        })
+
+    # 5. Partition pruning (deep check)
+    if "from" in sql_lower:
+        if "where" not in sql_lower:
+            findings.append({
+                "pid": "QO-002",
+                "msg": "No WHERE clause — full table scan will occur on every partition.",
+                "fix": (
+                    sql.rstrip().rstrip(";")
+                    + "\nWHERE _PARTITIONDATE = CURRENT_DATE()"
+                    + "  -- adjust to your actual partition column"
+                ),
+            })
+        elif not _has_partition_filter(sql_lower):
+            findings.append({
+                "pid": "QO-002",
+                "msg": (
+                    "WHERE clause present but no date/time partition filter detected — "
+                    "partition pruning may not be active. If the target table is partitioned, "
+                    "add a filter on the partition column."
+                ),
+                "fix": (
+                    "-- Add one of the following to your WHERE clause:\n"
+                    "--   AND _PARTITIONDATE = CURRENT_DATE()\n"
+                    "--   AND DATE(created_at) BETWEEN '2024-01-01' AND '2024-01-31'\n"
+                    "--   AND event_ts >= TIMESTAMP('2024-01-01')"
+                ),
+            })
+
+    # 6. NOT IN (subquery)
+    if "not in (select" in sql_lower:
+        findings.append({
+            "pid": "QO-005",
+            "msg": "NOT IN (subquery) — prefer NOT EXISTS or LEFT JOIN / IS NULL.",
+            "fix": (
+                "-- Option A — NOT EXISTS (often faster, handles NULLs correctly):\n"
+                "-- WHERE NOT EXISTS (\n"
+                "--   SELECT 1 FROM other_table\n"
+                "--   WHERE other_table.id = main_table.id\n"
+                "-- )\n\n"
+                "-- Option B — LEFT JOIN / IS NULL:\n"
+                "-- LEFT JOIN other_table ON main_table.id = other_table.id\n"
+                "-- WHERE other_table.id IS NULL"
+            ),
+        })
+
+    # 7. Deeply nested subqueries
+    if sql_lower.count("select") > 2:
+        findings.append({
+            "pid": "QO-004",
+            "msg": "Multiple nested subqueries — CTEs (WITH clauses) improve readability and optimizer visibility.",
+            "fix": (
+                "WITH step1 AS (\n"
+                "  -- first subquery\n"
+                "),\n"
+                "step2 AS (\n"
+                "  SELECT * FROM step1 WHERE ...\n"
+                ")\n"
+                "SELECT * FROM step2;"
+            ),
+        })
+
+    # 8. HAVING without GROUP BY
+    if "having" in sql_lower and "group by" not in sql_lower:
+        findings.append({
+            "pid": "QO-004",
+            "msg": "HAVING without GROUP BY — likely a logic error. Use WHERE to filter individual rows.",
+            "fix": re.sub(r"(?i)\bhaving\b", "WHERE", sql, count=1),
+        })
+
+    # 9. COUNT(DISTINCT) — suggest approximate variant
+    if "count(distinct" in sql_lower:
+        findings.append({
+            "pid": "QO-006",
+            "msg": "COUNT(DISTINCT) — use APPROX_COUNT_DISTINCT() for large datasets (~1% error, dramatically faster).",
+            "fix": re.sub(
+                r"(?i)COUNT\s*\(\s*DISTINCT\s+(\w+)\s*\)",
+                r"APPROX_COUNT_DISTINCT(\1)",
+                sql,
+            ),
+        })
+
+    # 10. JOIN order analysis
+    join_issue = _detect_join_order_issue(sql_lower)
+    if join_issue:
+        findings.append({
+            "pid": "QO-003",
+            "msg": f"JOIN order: {join_issue}",
+            "fix": (
+                "-- Place the largest table first (left side) in your JOIN:\n"
+                "-- FROM large_table\n"
+                "-- JOIN smaller_filtered_result ON large_table.id = smaller_filtered_result.id"
+            ),
+        })
+
+    # ── Format output ──
     if not findings:
-        result = (
-            "✅ No obvious best-practice violations detected.\n\n"
-            "Always verify: partition pruning is active, clustering columns are filtered, "
-            "and data types match the column definitions."
-        )
-    else:
-        result = (
-            f"Found {len(findings)} potential issue(s):\n\n"
-            + "\n".join(findings)
-            + "\n\nUse `get_practice_detail` with any ID above for full guidance, "
-            "or `get_practices` with a relevant topic for broader context."
-        )
-    return [types.TextContent(type="text", text=result)]
+        return [types.TextContent(
+            type="text",
+            text=(
+                "No obvious best-practice violations detected.\n\n"
+                "Always verify: partition pruning is active, clustering columns are filtered, "
+                "and data types match column definitions."
+            ),
+        )]
+
+    parts = [f"Found {len(findings)} potential issue(s):\n"]
+    for i, f in enumerate(findings, 1):
+        parts.append(f"### {i}. [{f['pid']}] {f['msg']}\n")
+        parts.append(f"**Suggested fix:**\n```sql\n{f['fix']}\n```\n")
+    parts.append(
+        "---\nUse `get_practice_detail` with any ID above for full guidance, "
+        "or `get_practices` with a relevant topic for broader context."
+    )
+    return [types.TextContent(type="text", text="\n".join(parts))]
 
 
 # ─────────────────────────────────────────────
